@@ -7,7 +7,6 @@ package tiff
 import (
 	"bytes"
 	"image"
-	"image/png"
 	"io/ioutil"
 	"os"
 	"testing"
@@ -48,19 +47,6 @@ func openImage(filename string) (image.Image, error) {
 	}
 	defer f.Close()
 	return Decode(f)
-}
-
-func writeImgToPNG(filename string, img image.Image) (string, error) {
-
-	filename += ".png"
-
-	f, err := os.Create(filename)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	return filename, png.Encode(f, img)
 }
 
 func TestRoundtrip(t *testing.T) {

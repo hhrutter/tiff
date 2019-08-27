@@ -4,9 +4,9 @@
 
 // Package tiff is an enhanced version of x/image/tiff.
 //
-// It uses a consolidated version of compress/lzw (https://github.com/hhrutter/tree/master/lzw) for compression and also adds support for CMYK.
+// It uses a consolidated version of compress/lzw (https://github.com/hhrutter/lzw) for compression and also adds support for CMYK.
 //
-// More information: https://github.com/hhrutter/tree/master/tiff
+// More information: https://github.com/hhrutter/tiff
 package tiff
 
 import (
@@ -394,7 +394,6 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 			}
 		}
 	case mCMYK:
-		// Horst Rutter:
 		// d.bpp must be 8
 		img := dst.(*image.CMYK)
 		for y := ymin; y < rMaxY; y++ {
@@ -456,8 +455,6 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		}
 		prevTag = tag
 	}
-
-	//fmt.Printf("tags: %v\n", d.features)
 
 	d.config.Width = int(d.firstVal(tImageWidth))
 	d.config.Height = int(d.firstVal(tImageLength))
@@ -569,10 +566,16 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 	return d.config, nil
 }
 
+func ccittFillOrder(tiffFillOrder uint) ccitt.Order {
+	if tiffFillOrder == 2 {
+		return ccitt.LSB
+	}
+	return ccitt.MSB
+}
+
 // Decode reads a TIFF image from r and returns it as an image.Image.
 // The type of Image returned depends on the contents of the TIFF.
 func Decode(r io.Reader) (img image.Image, err error) {
-
 	d, err := newDecoder(r)
 	if err != nil {
 		return
@@ -665,11 +668,11 @@ func Decode(r io.Reader) (img image.Image, err error) {
 			}
 			offset := int64(blockOffsets[j*blocksAcross+i])
 			n := int64(blockCounts[j*blocksAcross+i])
-			LSBToMSB := d.firstVal(tFillOrder) == 2
-			order := ccitt.MSB
-			if LSBToMSB {
-				order = ccitt.LSB
-			}
+			// LSBToMSB := d.firstVal(tFillOrder) == 2
+			// order := ccitt.MSB
+			// if LSBToMSB {
+			// 	order = ccitt.LSB
+			// }
 			switch d.firstVal(tCompression) {
 
 			// According to the spec, Compression does not have a default value,
@@ -683,15 +686,15 @@ func Decode(r io.Reader) (img image.Image, err error) {
 					_, err = d.r.ReadAt(d.buf, offset)
 				}
 			case cG3:
-				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group3, d.config.Width, d.config.Height, nil)
-				//r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), ccitt.Group3, d.config.Width, true, false, LSBToMSB)
+				inv := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
+				order := ccittFillOrder(d.firstVal(tFillOrder))
+				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group3, blkW, blkH, &ccitt.Options{Invert: inv, Align: false})
 				d.buf, err = ioutil.ReadAll(r)
-				//r.Close()
 			case cG4:
-				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group4, d.config.Width, d.config.Height, nil)
-				//r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), ccitt.Group4, d.config.Width, true, false, LSBToMSB)
+				inv := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
+				order := ccittFillOrder(d.firstVal(tFillOrder))
+				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group4, blkW, blkH, &ccitt.Options{Invert: inv, Align: false})
 				d.buf, err = ioutil.ReadAll(r)
-				//r.Close()
 			case cLZW:
 				r := lzw.NewReader(io.NewSectionReader(d.r, offset, n), true)
 				d.buf, err = ioutil.ReadAll(r)

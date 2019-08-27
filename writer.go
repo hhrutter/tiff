@@ -169,7 +169,6 @@ func encodeRGBA64(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) 
 	return nil
 }
 
-// Horst Rutter
 func encodeCMYK(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) error {
 	if !predictor {
 		return writePix(w, pix, dy, dx*4, stride)
@@ -325,7 +324,6 @@ func Encode(w io.Writer, m image.Image, opt *Options) error {
 	predictor := false
 	if opt != nil {
 		compression = opt.Compression.specValue()
-		// Horst Rutter
 		// The TIFF 6.0 spec (June,1992) says the predictor field is only to be used with LZW. (See page 64).
 		// Yet this TIFF writer also allows prediction for Deflate compression.
 		// This makes sense as Deflate is supposedly the successor to LWZ.
@@ -349,7 +347,6 @@ func Encode(w io.Writer, m image.Image, opt *Options) error {
 	var imageLen int
 
 	switch compression {
-
 	case cNone:
 		dst = w
 		// Write IFD offset before outputting pixel data.
@@ -365,22 +362,17 @@ func Encode(w io.Writer, m image.Image, opt *Options) error {
 		case *image.NRGBA64:
 			imageLen = d.X * d.Y * 8
 		case *image.CMYK:
-			// Horst Rutter
 			imageLen = d.X * d.Y * 4
 		default:
 			imageLen = d.X * d.Y * 4
 		}
 		err = binary.Write(w, enc, uint32(imageLen+8))
-
 	case cLZW:
 		dst = lzw.NewWriter(&buf, true)
-
 	case cDeflate:
 		dst = zlib.NewWriter(&buf)
-
 	default:
 		err = UnsupportedError(fmt.Sprintf("compression value %d", compression))
-
 	}
 
 	if err != nil {
@@ -435,7 +427,6 @@ func Encode(w io.Writer, m image.Image, opt *Options) error {
 		bitsPerSample = []uint32{16, 16, 16, 16}
 		err = encodeRGBA64(dst, m.Pix, d.X, d.Y, m.Stride, predictor)
 	case *image.CMYK:
-		// Horst Rutter
 		photometricInterpretation = uint32(pCMYK)
 		samplesPerPixel = uint32(4)
 		bitsPerSample = []uint32{8, 8, 8, 8}
