@@ -1,8 +1,8 @@
 module github.com/hhrutter/tiff
 
-go 1.12
+go 1.19
 
 require (
-	github.com/hhrutter/lzw v0.0.0-20190827003112-58b82c5a41cc
-	golang.org/x/image v0.0.0-20190823064033-3a9bac650e44
+	github.com/hhrutter/lzw v0.0.0-20230302233922-b0c9d7de54a7
+	golang.org/x/image v0.5.0
 )
