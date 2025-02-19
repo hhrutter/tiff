@@ -5,6 +5,8 @@ This package is an improved version of [x/image/tiff](https://github.com/golang/
 * Read support for CCITT Group3/4 compressed images using [x/image/ccitt](https://github.com/golang/image/tree/master/ccitt)
 * Read/write support for LZW compressed images using [github.com/hhrutter/lzw](https://github.com/hhrutter/lzw)
 * Read/write support for the CMYK color model.
+* Read support for JPEG compressed images.
+* Read support for multi page TIFF files.
 
 
 ## Background
@@ -20,4 +22,4 @@ Working on [pdfcpu](https://github.com/pdfcpu/pdfcpu) (a PDF processor) created 
 
 ## Goal
 
-An improved version of [x/image/tiff](https://github.com/golang/image/tree/master/tiff) with full read/write support for CCITT, LZW compression and the CMYK color model.
+An improved version of [x/image/tiff](https://github.com/golang/image/tree/master/tiff) with full read/write support for CCITT, LZW, JPEG compression and the CMYK color model.

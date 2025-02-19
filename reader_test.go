@@ -10,11 +10,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"image"
-	"io/ioutil"
+
 	"os"
 	"strings"
 	"testing"
 
+	_ "image/jpeg"
 	_ "image/png"
 )
 
@@ -80,7 +81,7 @@ func TestUnpackBits(t *testing.T) {
 }
 
 func TestShortBlockData(t *testing.T) {
-	b, err := ioutil.ReadFile("testdata/bw-uncompressed.tiff")
+	b, err := os.ReadFile("testdata/bw-uncompressed.tiff")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +107,7 @@ func TestShortBlockData(t *testing.T) {
 }
 
 func TestDecodeInvalidDataType(t *testing.T) {
-	b, err := ioutil.ReadFile("testdata/bw-uncompressed.tiff")
+	b, err := os.ReadFile("testdata/bw-uncompressed.tiff")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,6 +193,12 @@ func TestDecodeLZW(t *testing.T) {
 	compare(t, img0, img1)
 }
 
+// TestDecodeJPG tests that decoding a JPEG image and a JPEG-compressed TIFF
+// image result in the same pixel data.
+func TestDecodeJPEG(t *testing.T) {
+	// TODO - JPEG is lossy
+}
+
 // TestDecodeCCITT tests that decoding a PNG image and a CCITT compressed TIFF
 // image result in the same pixel data.
 func TestDecodeCCITT(t *testing.T) {
@@ -221,7 +228,7 @@ func TestDecodeCCITT(t *testing.T) {
 // TestDecodeTagOrder tests that a malformed image with unsorted IFD entries is
 // correctly rejected.
 func TestDecodeTagOrder(t *testing.T) {
-	data, err := ioutil.ReadFile("testdata/video-001.tiff")
+	data, err := os.ReadFile("testdata/video-001.tiff")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +293,7 @@ func replace(src []byte, find, repl string) ([]byte, error) {
 // cause a crash.
 // Issue 10711.
 func TestZeroBitsPerSample(t *testing.T) {
-	b0, err := ioutil.ReadFile(testdataDir + "bw-deflate.tiff")
+	b0, err := os.ReadFile(testdataDir + "bw-deflate.tiff")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +321,7 @@ func TestZeroBitsPerSample(t *testing.T) {
 // the data available.
 // Issue 10712
 func TestTileTooBig(t *testing.T) {
-	b0, err := ioutil.ReadFile(testdataDir + "video-001-tile-64x64.tiff")
+	b0, err := os.ReadFile(testdataDir + "video-001-tile-64x64.tiff")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +411,7 @@ func TestLargeIFDEntry(t *testing.T) {
 // benchmarkDecode benchmarks the decoding of an image.
 func benchmarkDecode(b *testing.B, filename string) {
 	b.StopTimer()
-	contents, err := ioutil.ReadFile(testdataDir + filename)
+	contents, err := os.ReadFile(testdataDir + filename)
 	if err != nil {
 		b.Fatal(err)
 	}

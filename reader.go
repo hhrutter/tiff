@@ -10,13 +10,14 @@
 package tiff
 
 import (
+	"bytes"
 	"compress/zlib"
 	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"io"
-	"io/ioutil"
 	"math"
 
 	"github.com/hhrutter/lzw"
@@ -40,6 +41,17 @@ func (e UnsupportedError) Error() string {
 
 var errNoPixels = FormatError("not enough pixel data")
 
+var app14Marker = []byte{
+	0xFF, 0xEE,
+	0x00, 0x0E,
+	'A', 'd', 'o', 'b', 'e',
+	0x00,
+	0x64, 0x00,
+	0x00, 0x00,
+	0x00, 0x00,
+	0x00, // RGB
+}
+
 type decoder struct {
 	r         io.ReaderAt
 	byteOrder binary.ByteOrder
@@ -48,6 +60,7 @@ type decoder struct {
 	bpp       uint
 	features  map[int][]uint
 	palette   []color.Color
+	tables    []byte
 
 	buf   []byte
 	off   int    // Current offset in buf.
@@ -173,7 +186,19 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 				return 0, UnsupportedError("sample format")
 			}
 		}
+	case tJPEGTables:
+		// See Adobe Photoshop® TIFF Technical Notes.
+		datatype := d.byteOrder.Uint16(p[2:4])
+		if dt := int(datatype); dt != 7 {
+			return 0, UnsupportedError("IFD entry datatype")
+		}
+		size := d.byteOrder.Uint32(p[4:8])
+		d.tables = make([]byte, size-4)
+		if _, err := d.r.ReadAt(d.tables, int64(d.byteOrder.Uint32(p[8:12]))+2); err != nil {
+			return 0, err
+		}
 	}
+
 	return int(tag), nil
 }
 
@@ -411,7 +436,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 	return nil
 }
 
-func newDecoder(r io.Reader) (*decoder, error) {
+func newDecoderAt(r io.Reader, ifdOffset int64) (*decoder, error) {
 	d := &decoder{
 		r:        newReaderAt(r),
 		features: make(map[int][]uint),
@@ -430,7 +455,9 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		return nil, FormatError("malformed header")
 	}
 
-	ifdOffset := int64(d.byteOrder.Uint32(p[4:8]))
+	if ifdOffset == 0 {
+		ifdOffset = int64(d.byteOrder.Uint32(p[4:8]))
+	}
 
 	// The first two bytes contain the number of entries (12 bytes each).
 	if _, err := d.r.ReadAt(p[0:2], ifdOffset); err != nil {
@@ -559,7 +586,17 @@ func newDecoder(r io.Reader) (*decoder, error) {
 // DecodeConfig returns the color model and dimensions of a TIFF image without
 // decoding the entire image.
 func DecodeConfig(r io.Reader) (image.Config, error) {
-	d, err := newDecoder(r)
+	d, err := newDecoderAt(r, 0)
+	if err != nil {
+		return image.Config{}, err
+	}
+	return d.config, nil
+}
+
+// DecodeConfig returns the color model and dimensions of a TIFF image at ifdOffset without
+// decoding the entire image.
+func DecodeConfigAt(r io.Reader, ifdOffset int64) (image.Config, error) {
+	d, err := newDecoderAt(r, ifdOffset)
 	if err != nil {
 		return image.Config{}, err
 	}
@@ -573,14 +610,83 @@ func ccittFillOrder(tiffFillOrder uint) ccitt.Order {
 	return ccitt.MSB
 }
 
-// Decode reads a TIFF image from r and returns it as an image.Image.
-// The type of Image returned depends on the contents of the TIFF.
-func Decode(r io.Reader) (img image.Image, err error) {
-	d, err := newDecoder(r)
+func (d *decoder) copyStrip(dst image.Image, strip image.Image, x, y int) {
+	switch d.mode {
+	case mGray, mGrayInvert:
+		if d.bpp == 16 {
+			draw.Draw(dst.(*image.Gray16), image.Rect(x, y, x+strip.Bounds().Dx(), y+strip.Bounds().Dy()), strip, image.Point{}, draw.Over)
+		} else {
+			draw.Draw(dst.(*image.Gray), image.Rect(x, y, x+strip.Bounds().Dx(), y+strip.Bounds().Dy()), strip, image.Point{}, draw.Over)
+		}
+	case mPaletted:
+		draw.Draw(dst.(*image.Paletted), image.Rect(x, y, x+strip.Bounds().Dx(), y+strip.Bounds().Dy()), strip, image.Point{}, draw.Over)
+	case mNRGBA:
+		if d.bpp == 16 {
+			draw.Draw(dst.(*image.NRGBA64), image.Rect(x, y, x+strip.Bounds().Dx(), y+strip.Bounds().Dy()), strip, image.Point{}, draw.Over)
+		} else {
+			draw.Draw(dst.(*image.NRGBA), image.Rect(x, y, x+strip.Bounds().Dx(), y+strip.Bounds().Dy()), strip, image.Point{}, draw.Over)
+		}
+	case mRGB, mRGBA:
+		if d.bpp == 16 {
+			draw.Draw(dst.(*image.RGBA64), image.Rect(x, y, x+strip.Bounds().Dx(), y+strip.Bounds().Dy()), strip, image.Point{}, draw.Over)
+		} else {
+			draw.Draw(dst.(*image.RGBA), image.Rect(x, y, x+strip.Bounds().Dx(), y+strip.Bounds().Dy()), strip, image.Point{}, draw.Over)
+		}
+	case mCMYK:
+		draw.Draw(dst.(*image.CMYK), image.Rect(x, y, x+strip.Bounds().Dx(), y+strip.Bounds().Dy()), strip, image.Point{}, draw.Over)
+	}
+}
+
+func (d *decoder) prepJPEG(offset, n int64, needAPP14, needTables bool) (io.Reader, error) {
+	bb, err := io.ReadAll(io.NewSectionReader(d.r, offset, n))
 	if err != nil {
-		return
+		return nil, err
+	}
+	if len(bb) < 2 || bb[0] != 0xFF || bb[1] != 0xD8 {
+		return nil, FormatError("corrupt JPG stream")
 	}
 
+	if needAPP14 {
+		var buf bytes.Buffer
+		buf.Write(bb[:2])
+		buf.Write(app14Marker)
+		buf.Write(bb[2:])
+		bb = buf.Bytes()
+	}
+
+	if needTables {
+		sosIndex := bytes.Index(bb, []byte{0xFF, 0xDA})
+		if sosIndex == -1 {
+			return nil, FormatError("corrupt JPG stream")
+		}
+		var buf bytes.Buffer
+		buf.Write(bb[:sosIndex])
+		buf.Write(d.tables)
+		buf.Write(bb[sosIndex:])
+		bb = buf.Bytes()
+	}
+
+	return bytes.NewReader(bb), nil
+}
+
+func (d *decoder) decodeJPGOld(img image.Image, offset, n int64, i, j, blockWidth, blockHeight int) error {
+	var rd io.Reader = io.NewSectionReader(d.r, offset, n)
+	if len(d.features[tBitsPerSample]) == 4 && d.firstVal(tExtraSamples) > 0 {
+		var err error
+		rd, err = d.prepJPEG(offset, n, true, false)
+		if err != nil {
+			return err
+		}
+	}
+	img0, _, err := image.Decode(rd)
+	if err != nil {
+		return err
+	}
+	d.copyStrip(img, img0, i*blockWidth, j*blockHeight)
+	return nil
+}
+
+func decode(d *decoder) (img image.Image, err error) {
 	blockPadding := false
 	blockWidth := d.config.Width
 	blockHeight := d.config.Height
@@ -689,15 +795,15 @@ func Decode(r io.Reader) (img image.Image, err error) {
 				inv := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
 				order := ccittFillOrder(d.firstVal(tFillOrder))
 				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group3, blkW, blkH, &ccitt.Options{Invert: inv, Align: false})
-				d.buf, err = ioutil.ReadAll(r)
+				d.buf, err = io.ReadAll(r)
 			case cG4:
 				inv := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
 				order := ccittFillOrder(d.firstVal(tFillOrder))
 				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group4, blkW, blkH, &ccitt.Options{Invert: inv, Align: false})
-				d.buf, err = ioutil.ReadAll(r)
+				d.buf, err = io.ReadAll(r)
 			case cLZW:
 				r := lzw.NewReader(io.NewSectionReader(d.r, offset, n), true)
-				d.buf, err = ioutil.ReadAll(r)
+				d.buf, err = io.ReadAll(r)
 				r.Close()
 			case cDeflate, cDeflateOld:
 				var r io.ReadCloser
@@ -705,8 +811,31 @@ func Decode(r io.Reader) (img image.Image, err error) {
 				if err != nil {
 					return nil, err
 				}
-				d.buf, err = ioutil.ReadAll(r)
+				d.buf, err = io.ReadAll(r)
 				r.Close()
+			case cJPEGOld:
+				if err := d.decodeJPGOld(img, offset, n, i, j, blockWidth, blockHeight); err != nil {
+					return nil, err
+				}
+				continue
+			case cJPEG:
+				if len(d.tables) == 0 {
+					if err := d.decodeJPGOld(img, offset, n, i, j, blockWidth, blockHeight); err != nil {
+						return nil, err
+					}
+					continue
+				}
+				needAPP14 := len(d.features[tBitsPerSample]) == 4 && d.firstVal(tExtraSamples) > 0
+				rd, err := d.prepJPEG(offset, n, needAPP14, true)
+				if err != nil {
+					return nil, err
+				}
+				img0, _, err := image.Decode(rd)
+				if err != nil {
+					return nil, err
+				}
+				d.copyStrip(img, img0, i*blockWidth, j*blockHeight)
+				continue
 			case cPackBits:
 				d.buf, err = unpackBits(io.NewSectionReader(d.r, offset, n))
 			default:
@@ -727,6 +856,26 @@ func Decode(r io.Reader) (img image.Image, err error) {
 		}
 	}
 	return
+}
+
+// Decode reads a TIFF image from r and returns it as an image.Image.
+// The type of Image returned depends on the contents of the TIFF.
+func Decode(r io.Reader) (img image.Image, err error) {
+	d, err := newDecoderAt(r, 0)
+	if err != nil {
+		return
+	}
+	return decode(d)
+}
+
+// DecodeAt reads a TIFF image from r at ifdOffset and returns it as an image.Image.
+// The type of Image returned depends on the contents of the TIFF.
+func DecodeAt(r io.Reader, ifdOffset int64) (img image.Image, err error) {
+	d, err := newDecoderAt(r, ifdOffset)
+	if err != nil {
+		return
+	}
+	return decode(d)
 }
 
 func init() {

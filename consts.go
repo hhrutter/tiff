@@ -65,6 +65,8 @@ const (
 	tColorMap     = 320
 	tExtraSamples = 338
 	tSampleFormat = 339
+
+	tJPEGTables = 347
 )
 
 // Compression types (defined in various places in the spec and supplements).
@@ -130,6 +132,8 @@ const (
 	LZW
 	CCITTGroup3
 	CCITTGroup4
+	JPEGOld
+	JPEG
 )
 
 // specValue returns the compression type constant from the TIFF spec that
@@ -144,6 +148,10 @@ func (c CompressionType) specValue() uint32 {
 		return cG3
 	case CCITTGroup4:
 		return cG4
+	case JPEGOld:
+		return cJPEGOld
+	case JPEG:
+		return cJPEG
 	}
 	return cNone
 }
