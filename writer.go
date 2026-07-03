@@ -13,8 +13,6 @@ import (
 	"image"
 	"io"
 	"sort"
-
-	"github.com/hhrutter/lzw"
 )
 
 // The TIFF format allows to choose the order of the different elements freely.
@@ -348,7 +346,7 @@ func imageWriter(compression uint32, buf *bytes.Buffer) (io.Writer, io.Closer, e
 	case cNone:
 		return buf, nil, nil
 	case cLZW:
-		w := lzw.NewWriter(buf, true)
+		w := newTIFFLZWWriter(buf)
 		return w, w, nil
 	case cDeflate:
 		w := zlib.NewWriter(buf)

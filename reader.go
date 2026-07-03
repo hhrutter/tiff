@@ -4,7 +4,7 @@
 
 // Package tiff is an enhanced version of x/image/tiff.
 //
-// It uses a consolidated version of compress/lzw (https://github.com/hhrutter/lzw) for compression and also adds support for CMYK.
+// It adds support for LZW compression and the CMYK color model.
 //
 // More information: https://github.com/hhrutter/tiff
 package tiff
@@ -20,8 +20,8 @@ import (
 	"io"
 	"math"
 
-	"github.com/hhrutter/lzw"
 	"golang.org/x/image/ccitt"
+	"golang.org/x/image/tiff/lzw"
 )
 
 // A FormatError reports that the input is not a valid TIFF image.
@@ -977,7 +977,7 @@ func decode(d *decoder) (img image.Image, err error) {
 				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group4, blkW, blkH, opts)
 				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
 			case cLZW:
-				r := lzw.NewReader(io.NewSectionReader(d.r, offset, n), true)
+				r := lzw.NewReader(io.NewSectionReader(d.r, offset, n), lzw.MSB, 8)
 				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
 				r.Close()
 			case cDeflate, cDeflateOld:
