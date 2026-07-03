@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"image"
+	"image/color"
 
 	"os"
 	"strings"
@@ -259,6 +260,76 @@ func TestCCITTOptions(t *testing.T) {
 	_, err = d.ccittOptions(cG4)
 	if err == nil {
 		t.Fatal("ccittOptions accepted unsupported Group 4 uncompressed mode")
+	}
+}
+
+func packBits(s string) []byte {
+	bb := make([]byte, (len(s)+7)/8)
+	for i, c := range s {
+		if c == '1' {
+			bb[i/8] |= 0x80 >> uint(i&7)
+		}
+	}
+	return bb
+}
+
+func ccittRLETestTIFF() []byte {
+	// Row 0 is four white pixels followed by four black pixels.
+	// Row 1 starts with a zero-length white run and then eight black pixels.
+	data := packBits("1011011") // white 4, black 4
+	data = append(data, packBits("00110101000101")...)
+	ifdOffset := uint32(8 + len(data))
+	ifd, _ := marshalIFD(ifdOffset, 0, []ifdEntry{
+		{tImageWidth, dtShort, []uint32{8}},
+		{tImageLength, dtShort, []uint32{2}},
+		{tBitsPerSample, dtShort, []uint32{1}},
+		{tCompression, dtShort, []uint32{cCCITT}},
+		{tPhotometricInterpretation, dtShort, []uint32{pWhiteIsZero}},
+		{tFillOrder, dtShort, []uint32{1}},
+		{tStripOffsets, dtLong, []uint32{8}},
+		{tSamplesPerPixel, dtShort, []uint32{1}},
+		{tRowsPerStrip, dtShort, []uint32{2}},
+		{tStripByteCounts, dtLong, []uint32{uint32(len(data))}},
+	})
+
+	var b bytes.Buffer
+	b.WriteString(leHeader)
+	_ = binary.Write(&b, enc, ifdOffset)
+	b.Write(data)
+	b.Write(ifd)
+	return b.Bytes()
+}
+
+func TestDecodeCCITTRLE(t *testing.T) {
+	img, err := Decode(bytes.NewReader(ccittRLETestTIFF()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := img.(*image.Gray)
+	for x := 0; x < 4; x++ {
+		if c := got.GrayAt(x, 0); c != (color.Gray{Y: 0xff}) {
+			t.Fatalf("pixel (%d,0) = %v, want white", x, c)
+		}
+	}
+	for x := 4; x < 8; x++ {
+		if c := got.GrayAt(x, 0); c != (color.Gray{}) {
+			t.Fatalf("pixel (%d,0) = %v, want black", x, c)
+		}
+	}
+	for x := 0; x < 8; x++ {
+		if c := got.GrayAt(x, 1); c != (color.Gray{}) {
+			t.Fatalf("pixel (%d,1) = %v, want black", x, c)
+		}
+	}
+}
+
+func TestDecodeCCITTRLEIssue2(t *testing.T) {
+	img, err := load("issue-2-ccitt-rle.tif")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := img.Bounds().Size(); got != (image.Point{X: 186, Y: 280}) {
+		t.Fatalf("bounds = %v, want 186x280", got)
 	}
 }
 

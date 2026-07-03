@@ -813,6 +813,13 @@ func decode(d *decoder) (img image.Image, err error) {
 					d.buf = make([]byte, n)
 					_, err = d.r.ReadAt(d.buf, offset)
 				}
+			case cCCITT:
+				if d.bpp != 1 {
+					return nil, UnsupportedError("CCITT RLE with BitsPerSample != 1")
+				}
+				order := ccittFillOrder(d.firstVal(tFillOrder))
+				whiteIsZero := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
+				d.buf, err = decodeCCITTRLE(io.NewSectionReader(d.r, offset, n), order, blkW, blkH, whiteIsZero)
 			case cG3:
 				opts, err := d.ccittOptions(cG3)
 				if err != nil {
