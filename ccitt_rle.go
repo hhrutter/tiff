@@ -124,14 +124,18 @@ func setMHRun(row []byte, start, n int, bit byte) {
 	}
 }
 
-func decodeCCITTRLE(r io.Reader, order ccitt.Order, width, height int, whiteIsZero bool) ([]byte, error) {
-	data, err := io.ReadAll(r)
+func decodeCCITTRLE(r io.Reader, order ccitt.Order, width, height int, whiteIsZero bool, lim int64) ([]byte, error) {
+	data, err := readBuf(r, nil, lim)
 	if err != nil {
 		return nil, err
 	}
 	br := mhBitReader{data: data, order: order}
 	stride := (width + 7) / 8
-	dst := make([]byte, stride*height)
+	dstLen, ok := checkedMul3(stride, height, 1)
+	if !ok || dstLen > lim {
+		return nil, FormatError("block data size too large")
+	}
+	dst := make([]byte, dstLen)
 	whiteBit, blackBit := byte(0), byte(1)
 	if !whiteIsZero {
 		whiteBit, blackBit = 1, 0

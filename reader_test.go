@@ -71,7 +71,7 @@ func TestUnpackBits(t *testing.T) {
 		"\xaa\xaa\xaa\x80\x00\x2a\xaa\xaa\xaa\xaa\x80\x00\x2a\x22\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa",
 	}}
 	for _, u := range unpackBitsTests {
-		buf, err := unpackBits(strings.NewReader(u.compressed))
+		buf, err := unpackBits(strings.NewReader(u.compressed), int64(len(u.uncompressed)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -513,6 +513,54 @@ func TestLargeIFDEntry(t *testing.T) {
 	_, err := Decode(strings.NewReader(testdata))
 	if err == nil {
 		t.Fatal("Decode with large IFD entry: got nil error, want non-nil")
+	}
+}
+
+func testTIFF(entries []ifdEntry) []byte {
+	ifd, _ := marshalIFD(8, 0, entries)
+	var b bytes.Buffer
+	b.WriteString(leHeader)
+	_ = binary.Write(&b, enc, uint32(8))
+	b.Write(ifd)
+	return b.Bytes()
+}
+
+func writeIFDEntry(b *bytes.Buffer, tag int, datatype uint16, count, value uint32) {
+	var p [ifdLen]byte
+	enc.PutUint16(p[0:2], uint16(tag))
+	enc.PutUint16(p[2:4], datatype)
+	enc.PutUint32(p[4:8], count)
+	enc.PutUint32(p[8:12], value)
+	b.Write(p[:])
+}
+
+func TestRejectSmallJPEGTables(t *testing.T) {
+	var b bytes.Buffer
+	b.WriteString(leHeader)
+	_ = binary.Write(&b, enc, uint32(8))
+	_ = binary.Write(&b, enc, uint16(5))
+	writeIFDEntry(&b, tImageWidth, dtShort, 1, 1)
+	writeIFDEntry(&b, tImageLength, dtShort, 1, 1)
+	writeIFDEntry(&b, tBitsPerSample, dtShort, 1, 8)
+	writeIFDEntry(&b, tPhotometricInterpretation, dtShort, 1, pBlackIsZero)
+	writeIFDEntry(&b, tJPEGTables, 7, 2, 0)
+	_ = binary.Write(&b, enc, uint32(0))
+
+	if _, err := DecodeConfig(bytes.NewReader(b.Bytes())); err == nil {
+		t.Fatal("DecodeConfig with short JPEG tables: got nil error, want non-nil")
+	}
+}
+
+func TestRejectHugeDimensions(t *testing.T) {
+	b := testTIFF([]ifdEntry{
+		{tImageWidth, dtLong, []uint32{1 << 30}},
+		{tImageLength, dtLong, []uint32{1 << 30}},
+		{tBitsPerSample, dtShort, []uint32{8}},
+		{tPhotometricInterpretation, dtShort, []uint32{pBlackIsZero}},
+	})
+
+	if _, err := DecodeConfig(bytes.NewReader(b)); err == nil {
+		t.Fatal("DecodeConfig with huge dimensions: got nil error, want non-nil")
 	}
 }
 

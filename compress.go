@@ -6,6 +6,7 @@ package tiff
 
 import (
 	"bufio"
+	"errors"
 	"io"
 )
 
@@ -19,7 +20,7 @@ type byteReader interface {
 //
 // The PackBits compression format is described in section 9 (p. 42)
 // of the TIFF spec.
-func unpackBits(r io.Reader) ([]byte, error) {
+func unpackBits(r io.Reader, lim int64) ([]byte, error) {
 	buf := make([]byte, 128)
 	dst := make([]byte, 0, 1024)
 	br, ok := r.(byteReader)
@@ -42,12 +43,18 @@ func unpackBits(r io.Reader) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
+			if int64(len(dst)+n) > lim {
+				return nil, errors.New("tiff: PackBits data too large")
+			}
 			dst = append(dst, buf[:n]...)
 		case code == -128:
 			// No-op.
 		default:
 			if b, err = br.ReadByte(); err != nil {
 				return nil, err
+			}
+			if int64(len(dst)+1-code) > lim {
+				return nil, errors.New("tiff: PackBits data too large")
 			}
 			for j := 0; j < 1-code; j++ {
 				buf[j] = b
