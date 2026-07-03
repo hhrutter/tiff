@@ -610,6 +610,28 @@ func ccittFillOrder(tiffFillOrder uint) ccitt.Order {
 	return ccitt.MSB
 }
 
+func (d *decoder) ccittOptions(compression uint) (*ccitt.Options, error) {
+	opts := &ccitt.Options{
+		Invert: d.firstVal(tPhotometricInterpretation) == pWhiteIsZero,
+	}
+	switch compression {
+	case cG3:
+		t4Options := d.firstVal(tT4Options)
+		if t4Options&1 != 0 {
+			return nil, UnsupportedError("CCITT Group 3 2-D coding")
+		}
+		if t4Options&2 != 0 {
+			return nil, UnsupportedError("CCITT Group 3 uncompressed mode")
+		}
+		opts.Align = t4Options&4 != 0
+	case cG4:
+		if d.firstVal(tT6Options)&2 != 0 {
+			return nil, UnsupportedError("CCITT Group 4 uncompressed mode")
+		}
+	}
+	return opts, nil
+}
+
 func (d *decoder) copyStrip(dst image.Image, strip image.Image, x, y int) {
 	switch d.mode {
 	case mGray, mGrayInvert:
@@ -792,14 +814,20 @@ func decode(d *decoder) (img image.Image, err error) {
 					_, err = d.r.ReadAt(d.buf, offset)
 				}
 			case cG3:
-				inv := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
+				opts, err := d.ccittOptions(cG3)
+				if err != nil {
+					return nil, err
+				}
 				order := ccittFillOrder(d.firstVal(tFillOrder))
-				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group3, blkW, blkH, &ccitt.Options{Invert: inv, Align: false})
+				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group3, blkW, blkH, opts)
 				d.buf, err = io.ReadAll(r)
 			case cG4:
-				inv := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
+				opts, err := d.ccittOptions(cG4)
+				if err != nil {
+					return nil, err
+				}
 				order := ccittFillOrder(d.firstVal(tFillOrder))
-				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group4, blkW, blkH, &ccitt.Options{Invert: inv, Align: false})
+				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group4, blkW, blkH, opts)
 				d.buf, err = io.ReadAll(r)
 			case cLZW:
 				r := lzw.NewReader(io.NewSectionReader(d.r, offset, n), true)

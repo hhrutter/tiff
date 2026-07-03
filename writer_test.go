@@ -88,6 +88,55 @@ func TestRoundtrip2(t *testing.T) {
 	compare(t, m0, m1)
 }
 
+func nextIFDOffset(b []byte, ifdOffset uint32) uint32 {
+	n := uint32(enc.Uint16(b[ifdOffset:]))
+	return enc.Uint32(b[ifdOffset+2+n*ifdLen:])
+}
+
+func TestEncodeAll(t *testing.T) {
+	m0 := image.NewGray(image.Rect(0, 0, 4, 3))
+	for i := range m0.Pix {
+		m0.Pix[i] = byte(i * 11)
+	}
+	m1 := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	for i := range m1.Pix {
+		m1.Pix[i] = byte(255 - i*7)
+	}
+
+	out := new(bytes.Buffer)
+	if err := EncodeAll(out, []image.Image{m0, m1}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	b := out.Bytes()
+	firstIFDOffset := enc.Uint32(b[4:8])
+	secondIFDOffset := nextIFDOffset(b, firstIFDOffset)
+	if secondIFDOffset == 0 {
+		t.Fatal("second IFD offset = 0, want non-zero")
+	}
+	if got := nextIFDOffset(b, secondIFDOffset); got != 0 {
+		t.Fatalf("third IFD offset = %d, want 0", got)
+	}
+
+	got0, err := Decode(&buffer{buf: b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare(t, m0, got0)
+
+	got1, err := DecodeAt(&buffer{buf: b}, int64(secondIFDOffset))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compare(t, m1, got1)
+}
+
+func TestEncodeAllNoImages(t *testing.T) {
+	if err := EncodeAll(new(bytes.Buffer), nil, nil); err == nil {
+		t.Fatal("EncodeAll with no images: got nil error, want non-nil")
+	}
+}
+
 func benchmarkEncode(b *testing.B, name string, pixelSize int) {
 	img, err := openImage(name)
 	if err != nil {

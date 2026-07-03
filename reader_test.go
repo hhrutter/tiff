@@ -225,6 +225,43 @@ func TestDecodeCCITT(t *testing.T) {
 	}
 }
 
+func TestCCITTOptions(t *testing.T) {
+	d := &decoder{
+		features: map[int][]uint{
+			tPhotometricInterpretation: {pWhiteIsZero},
+			tT4Options:                 {4},
+		},
+	}
+	opts, err := d.ccittOptions(cG3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.Invert {
+		t.Fatal("Invert = false, want true")
+	}
+	if !opts.Align {
+		t.Fatal("Align = false, want true")
+	}
+
+	d.features[tT4Options] = []uint{1}
+	_, err = d.ccittOptions(cG3)
+	if err == nil {
+		t.Fatal("ccittOptions accepted unsupported Group 3 2-D coding")
+	}
+
+	d.features[tT4Options] = []uint{2}
+	_, err = d.ccittOptions(cG3)
+	if err == nil {
+		t.Fatal("ccittOptions accepted unsupported Group 3 uncompressed mode")
+	}
+
+	d.features[tT6Options] = []uint{2}
+	_, err = d.ccittOptions(cG4)
+	if err == nil {
+		t.Fatal("ccittOptions accepted unsupported Group 4 uncompressed mode")
+	}
+}
+
 // TestDecodeTagOrder tests that a malformed image with unsorted IFD entries is
 // correctly rejected.
 func TestDecodeTagOrder(t *testing.T) {
