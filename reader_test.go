@@ -179,6 +179,88 @@ func TestDecode(t *testing.T) {
 	compare(t, img0, img4)
 }
 
+func rgbaTIFF(extraSamples *uint16) []byte {
+	entryCount := uint16(9)
+	if extraSamples != nil {
+		entryCount++
+	}
+	ifdLen := 2 + int(entryCount)*12 + 4
+	bitsOffset := uint32(8 + ifdLen)
+	stripOffset := bitsOffset + 8
+	b := make([]byte, stripOffset+4)
+
+	copy(b, "II")
+	binary.LittleEndian.PutUint16(b[2:], 42)
+	binary.LittleEndian.PutUint32(b[4:], 8)
+	binary.LittleEndian.PutUint16(b[8:], entryCount)
+
+	off := 10
+	putShortEntry := func(tag uint16, values ...uint16) {
+		binary.LittleEndian.PutUint16(b[off:], tag)
+		binary.LittleEndian.PutUint16(b[off+2:], uint16(dtShort))
+		binary.LittleEndian.PutUint32(b[off+4:], uint32(len(values)))
+		if len(values) == 1 {
+			binary.LittleEndian.PutUint16(b[off+8:], values[0])
+		} else {
+			binary.LittleEndian.PutUint32(b[off+8:], bitsOffset)
+			for i, v := range values {
+				binary.LittleEndian.PutUint16(b[int(bitsOffset)+i*2:], v)
+			}
+		}
+		off += 12
+	}
+	putLongEntry := func(tag uint16, value uint32) {
+		binary.LittleEndian.PutUint16(b[off:], tag)
+		binary.LittleEndian.PutUint16(b[off+2:], uint16(dtLong))
+		binary.LittleEndian.PutUint32(b[off+4:], 1)
+		binary.LittleEndian.PutUint32(b[off+8:], value)
+		off += 12
+	}
+
+	putShortEntry(tImageWidth, 1)
+	putShortEntry(tImageLength, 1)
+	putShortEntry(tBitsPerSample, 8, 8, 8, 8)
+	putShortEntry(tCompression, cNone)
+	putShortEntry(tPhotometricInterpretation, pRGB)
+	putLongEntry(tStripOffsets, stripOffset)
+	putShortEntry(tSamplesPerPixel, 4)
+	putShortEntry(tRowsPerStrip, 1)
+	putLongEntry(tStripByteCounts, 4)
+	if extraSamples != nil {
+		putShortEntry(tExtraSamples, *extraSamples)
+	}
+	copy(b[stripOffset:], []byte{0x20, 0x40, 0x80, 0xff})
+
+	return b
+}
+
+func TestDecodeRGBAWithUnspecifiedExtraSamples(t *testing.T) {
+	zero := uint16(0)
+	for _, tt := range []struct {
+		name         string
+		extraSamples *uint16
+	}{
+		{"missing", nil},
+		{"zero", &zero},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			img, err := Decode(bytes.NewReader(rgbaTIFF(tt.extraSamples)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := img.ColorModel(); got != color.RGBAModel {
+				t.Fatalf("ColorModel: got %v, want %v", got, color.RGBAModel)
+			}
+			if got := img.Bounds(); got != image.Rect(0, 0, 1, 1) {
+				t.Fatalf("Bounds: got %v, want %v", got, image.Rect(0, 0, 1, 1))
+			}
+			if got := color.RGBAModel.Convert(img.At(0, 0)); got != (color.RGBA{R: 0x20, G: 0x40, B: 0x80, A: 0xff}) {
+				t.Fatalf("At(0, 0): got %v", got)
+			}
+		})
+	}
+}
+
 // TestDecodeLZW tests that decoding a PNG image and a LZW-compressed TIFF
 // image result in the same pixel data.
 func TestDecodeLZW(t *testing.T) {

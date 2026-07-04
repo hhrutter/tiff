@@ -124,6 +124,25 @@ func (d *decoder) firstIntVal(tag int) (int, error) {
 	return int(v), nil
 }
 
+func (d *decoder) setRGBAMode(associated bool) {
+	if associated {
+		d.mode = mRGBA
+		if d.bpp == 16 {
+			d.config.ColorModel = color.RGBA64Model
+		} else {
+			d.config.ColorModel = color.RGBAModel
+		}
+		return
+	}
+
+	d.mode = mNRGBA
+	if d.bpp == 16 {
+		d.config.ColorModel = color.NRGBA64Model
+	} else {
+		d.config.ColorModel = color.NRGBAModel
+	}
+}
+
 // ifdUint decodes the IFD entry in p, which must be of the Byte, Short
 // or Long type, and returns the decoded uint values.
 //
@@ -619,9 +638,6 @@ func newDecoderAt(r io.Reader, ifdOffset int64) (*decoder, error) {
 		// RGB images normally have 3 samples per pixel.
 		// If there are more, ExtraSamples (p. 31-32 of the spec)
 		// gives their meaning (usually an alpha channel).
-		//
-		// This implementation does not support extra samples
-		// of an unspecified type.
 		switch len(d.features[tBitsPerSample]) {
 		case 3:
 			d.mode = mRGB
@@ -632,20 +648,10 @@ func newDecoderAt(r io.Reader, ifdOffset int64) (*decoder, error) {
 			}
 		case 4:
 			switch d.firstVal(tExtraSamples) {
-			case 1:
-				d.mode = mRGBA
-				if d.bpp == 16 {
-					d.config.ColorModel = color.RGBA64Model
-				} else {
-					d.config.ColorModel = color.RGBAModel
-				}
+			case 0, 1:
+				d.setRGBAMode(true)
 			case 2:
-				d.mode = mNRGBA
-				if d.bpp == 16 {
-					d.config.ColorModel = color.NRGBA64Model
-				} else {
-					d.config.ColorModel = color.NRGBAModel
-				}
+				d.setRGBAMode(false)
 			default:
 				return nil, FormatError("wrong number of samples for RGB")
 			}
