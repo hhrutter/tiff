@@ -17,6 +17,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"image/jpeg"
 	"io"
 	"math"
 
@@ -97,6 +98,7 @@ type decoder struct {
 	ifd       map[int][ifdLen]byte
 	palette   []color.Color
 	tables    []byte
+	ycbcr     *ycbcrConfig
 
 	buf   []byte
 	off   int    // Current offset in buf.
@@ -384,6 +386,8 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 		}
 	}
 
+	// Bytes in a full-width, single-component row, including right-edge tile padding.
+	rowBytes := int((int64(xmax-xmin)*int64(d.bpp) + 7) / 8)
 	rMaxX := minInt(xmax, dst.Bounds().Max.X)
 	rMaxY := minInt(ymax, dst.Bounds().Max.Y)
 	switch d.mode {
@@ -410,6 +414,8 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 			img := dst.(*image.Gray)
 			max := uint32((1 << d.bpp) - 1)
 			for y := ymin; y < rMaxY; y++ {
+				d.off = (y - ymin) * rowBytes
+				d.flushBits()
 				for x := xmin; x < rMaxX; x++ {
 					v, ok := d.readBits(d.bpp)
 					if !ok {
@@ -421,12 +427,13 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 					}
 					img.SetGray(x, y, color.Gray{uint8(v)})
 				}
-				d.flushBits()
 			}
 		}
 	case mPaletted:
 		img := dst.(*image.Paletted)
 		for y := ymin; y < rMaxY; y++ {
+			d.off = (y - ymin) * rowBytes
+			d.flushBits()
 			for x := xmin; x < rMaxX; x++ {
 				v, ok := d.readBits(d.bpp)
 				if !ok {
@@ -434,12 +441,12 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 				}
 				img.SetColorIndex(x, y, uint8(v))
 			}
-			d.flushBits()
 		}
 	case mRGB:
 		if d.bpp == 16 {
 			img := dst.(*image.RGBA64)
 			for y := ymin; y < rMaxY; y++ {
+				d.off = (y - ymin) * rowBytes * 3
 				for x := xmin; x < rMaxX; x++ {
 					if d.off+6 > len(d.buf) {
 						return errNoPixels
@@ -473,6 +480,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 		if d.bpp == 16 {
 			img := dst.(*image.NRGBA64)
 			for y := ymin; y < rMaxY; y++ {
+				d.off = (y - ymin) * rowBytes * 4
 				for x := xmin; x < rMaxX; x++ {
 					if d.off+8 > len(d.buf) {
 						return errNoPixels
@@ -501,6 +509,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 		if d.bpp == 16 {
 			img := dst.(*image.RGBA64)
 			for y := ymin; y < rMaxY; y++ {
+				d.off = (y - ymin) * rowBytes * 4
 				for x := xmin; x < rMaxX; x++ {
 					if d.off+8 > len(d.buf) {
 						return errNoPixels
@@ -550,142 +559,12 @@ func newDecoderAt(r io.Reader, ifdOffset int64) (*decoder, error) {
 		ifd:      make(map[int][ifdLen]byte),
 	}
 
-	p := make([]byte, 8)
-	if _, err := d.r.ReadAt(p, 0); err != nil {
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
+	if err := d.readImageIFD(ifdOffset); err != nil {
 		return nil, err
 	}
-	switch string(p[0:4]) {
-	case leHeader:
-		d.byteOrder = binary.LittleEndian
-	case beHeader:
-		d.byteOrder = binary.BigEndian
-	default:
-		return nil, FormatError("malformed header")
-	}
-
-	if ifdOffset == 0 {
-		ifdOffset = int64(d.byteOrder.Uint32(p[4:8]))
-	}
-
-	// The first two bytes contain the number of entries (12 bytes each).
-	if _, err := d.r.ReadAt(p[0:2], ifdOffset); err != nil {
+	if err := d.initConfig(); err != nil {
 		return nil, err
 	}
-	numItems := int(d.byteOrder.Uint16(p[0:2]))
-
-	// All IFD entries are read in one chunk.
-	var err error
-	p, err = safeReadAt(d.r, uint64(ifdLen*numItems), ifdOffset+2)
-	if err != nil {
-		return nil, err
-	}
-
-	prevTag := -1
-	for i := 0; i < len(p); i += ifdLen {
-		tag, err := d.parseIFD(p[i : i+ifdLen])
-		if err != nil {
-			return nil, err
-		}
-		if tag <= prevTag {
-			return nil, FormatError("tags are not sorted in ascending order")
-		}
-		prevTag = tag
-	}
-
-	if d.config.Width, err = d.firstIntVal(tImageWidth); err != nil {
-		return nil, err
-	}
-	if d.config.Height, err = d.firstIntVal(tImageLength); err != nil {
-		return nil, err
-	}
-	if _, ok := checkedMul3(d.config.Width, d.config.Height, maxBytesPerPixel); !ok {
-		return nil, FormatError("image too large")
-	}
-
-	if _, ok := d.features[tBitsPerSample]; !ok {
-		// Default is 1 per specification.
-		d.features[tBitsPerSample] = []uint{1}
-	}
-	d.bpp = d.firstVal(tBitsPerSample)
-	switch d.bpp {
-	case 0:
-		return nil, FormatError("BitsPerSample must not be 0")
-	case 1, 8, 16:
-		// Nothing to do, these are accepted by this implementation.
-	default:
-		return nil, UnsupportedError(fmt.Sprintf("BitsPerSample of %v", d.bpp))
-	}
-
-	// Determine the image mode.
-	switch d.firstVal(tPhotometricInterpretation) {
-	case pRGB:
-		if d.bpp == 16 {
-			for _, b := range d.features[tBitsPerSample] {
-				if b != 16 {
-					return nil, FormatError("wrong number of samples for 16bit RGB")
-				}
-			}
-		} else {
-			for _, b := range d.features[tBitsPerSample] {
-				if b != 8 {
-					return nil, FormatError("wrong number of samples for 8bit RGB")
-				}
-			}
-		}
-		// RGB images normally have 3 samples per pixel.
-		// If there are more, ExtraSamples (p. 31-32 of the spec)
-		// gives their meaning (usually an alpha channel).
-		switch len(d.features[tBitsPerSample]) {
-		case 3:
-			d.mode = mRGB
-			if d.bpp == 16 {
-				d.config.ColorModel = color.RGBA64Model
-			} else {
-				d.config.ColorModel = color.RGBAModel
-			}
-		case 4:
-			switch d.firstVal(tExtraSamples) {
-			case 0, 1:
-				d.setRGBAMode(true)
-			case 2:
-				d.setRGBAMode(false)
-			default:
-				return nil, FormatError("wrong number of samples for RGB")
-			}
-		default:
-			return nil, FormatError("wrong number of samples for RGB")
-		}
-	case pPaletted:
-		d.mode = mPaletted
-		d.config.ColorModel = color.Palette(d.palette)
-	case pWhiteIsZero:
-		d.mode = mGrayInvert
-		if d.bpp == 16 {
-			d.config.ColorModel = color.Gray16Model
-		} else {
-			d.config.ColorModel = color.GrayModel
-		}
-	case pBlackIsZero:
-		d.mode = mGray
-		if d.bpp == 16 {
-			d.config.ColorModel = color.Gray16Model
-		} else {
-			d.config.ColorModel = color.GrayModel
-		}
-	case pCMYK:
-		d.mode = mCMYK
-		if d.bpp == 16 {
-			return nil, UnsupportedError(fmt.Sprintf("CMYK BitsPerSample of %v", d.bpp))
-		}
-		d.config.ColorModel = color.CMYKModel
-
-	default:
-		return nil, UnsupportedError("color model")
-	}
-
 	return d, nil
 }
 
@@ -699,7 +578,7 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 	return d.config, nil
 }
 
-// DecodeConfig returns the color model and dimensions of a TIFF image at ifdOffset without
+// DecodeConfigAt returns the color model and dimensions of a TIFF image at ifdOffset without
 // decoding the entire image.
 func DecodeConfigAt(r io.Reader, ifdOffset int64) (image.Config, error) {
 	d, err := newDecoderAt(r, ifdOffset)
@@ -766,9 +645,6 @@ func (d *decoder) copyStrip(dst image.Image, strip image.Image, x, y int) {
 }
 
 func (d *decoder) prepJPEG(offset, n, lim int64, needAPP14, needTables bool) (io.Reader, error) {
-	if n > lim {
-		return nil, FormatError("block data size too large")
-	}
 	bb, err := safeReadAt(d.r, uint64(n), offset)
 	if err != nil {
 		return nil, err
@@ -797,6 +673,15 @@ func (d *decoder) prepJPEG(offset, n, lim int64, needAPP14, needTables bool) (io
 		bb = buf.Bytes()
 	}
 
+	// JPEG headers can exceed the uncompressed block size; bound decoded dimensions instead.
+	c, err := jpeg.DecodeConfig(bytes.NewReader(bb))
+	if err != nil {
+		return nil, err
+	}
+	size, ok := checkedMul3(c.Width, c.Height, maxBytesPerPixel)
+	if !ok || size > lim {
+		return nil, FormatError("JPEG dimensions exceed TIFF block size")
+	}
 	return bytes.NewReader(bb), nil
 }
 
@@ -1052,7 +937,7 @@ func Decode(r io.Reader) (img image.Image, err error) {
 	if err != nil {
 		return
 	}
-	return decode(d)
+	return decodeImage(d)
 }
 
 // DecodeAt reads a TIFF image from r at ifdOffset and returns it as an image.Image.
@@ -1062,7 +947,7 @@ func DecodeAt(r io.Reader, ifdOffset int64) (img image.Image, err error) {
 	if err != nil {
 		return
 	}
-	return decode(d)
+	return decodeImage(d)
 }
 
 func init() {

@@ -276,10 +276,10 @@ func TestDecodeLZW(t *testing.T) {
 	compare(t, img0, img1)
 }
 
-// TestDecodeJPG tests that decoding a JPEG image and a JPEG-compressed TIFF
+// TestDecodeJPEG tests that decoding a JPEG image and a JPEG-compressed TIFF
 // image result in the same pixel data.
 func TestDecodeJPEG(t *testing.T) {
-	// TODO - JPEG is lossy
+	testDecodeYCbCrJPEG(t)
 }
 
 // TestDecodeCCITT tests that decoding a PNG image and a CCITT compressed TIFF
