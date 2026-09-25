@@ -32,8 +32,7 @@ func (e FormatError) Error() string {
 	return "tiff: invalid format: " + string(e)
 }
 
-// An UnsupportedError reports that the input uses a valid but
-// unimplemented feature.
+// An UnsupportedError reports that the input uses a valid but unimplemented feature.
 type UnsupportedError string
 
 func (e UnsupportedError) Error() string {
@@ -63,10 +62,7 @@ func safeReadAt(r io.ReaderAt, n uint64, off int64) ([]byte, error) {
 	var buf []byte
 	buf1 := make([]byte, maxChunkSize)
 	for n > 0 {
-		next := n
-		if next > maxChunkSize {
-			next = maxChunkSize
-		}
+		next := min(n, maxChunkSize)
 		if _, err := r.ReadAt(buf1[:next], off); err != nil {
 			return nil, err
 		}
@@ -239,54 +235,72 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 		copy(entry[:], p)
 		d.ifd[int(tag)] = entry
 	case tColorMap:
-		val, err := d.ifdUint(p, 3*256+1)
-		if err != nil {
+		if err := d.parseIFDColorMap(p); err != nil {
 			return 0, err
-		}
-		numcolors := len(val) / 3
-		if len(val)%3 != 0 || numcolors <= 0 || numcolors > 256 {
-			return 0, FormatError("bad ColorMap length")
-		}
-		d.palette = make([]color.Color, numcolors)
-		for i := 0; i < numcolors; i++ {
-			d.palette[i] = color.RGBA64{
-				uint16(val[i]),
-				uint16(val[i+numcolors]),
-				uint16(val[i+2*numcolors]),
-				0xffff,
-			}
 		}
 	case tSampleFormat:
-		// Page 27 of the spec: If the SampleFormat is present and
-		// the value is not 1 [= unsigned integer data], a Baseline
-		// TIFF reader that cannot handle the SampleFormat value
-		// must terminate the import process gracefully.
-		val, err := d.ifdUint(p, smallEntryMaxCount)
-		if err != nil {
+		if err := d.parseIFDSampleFormat(p); err != nil {
 			return 0, err
 		}
-		for _, v := range val {
-			if v != 1 {
-				return 0, UnsupportedError("sample format")
-			}
-		}
 	case tJPEGTables:
-		datatype := d.byteOrder.Uint16(p[2:4])
-		if dt := int(datatype); dt != 7 {
-			return 0, UnsupportedError("IFD entry datatype")
-		}
-		size := d.byteOrder.Uint32(p[4:8])
-		if size < 4 {
-			return 0, FormatError("bad JPEG tables")
-		}
-		var err error
-		d.tables, err = safeReadAt(d.r, uint64(size-4), int64(d.byteOrder.Uint32(p[8:12]))+2)
-		if err != nil {
+		if err := d.parseIFDJPEGTables(p); err != nil {
 			return 0, err
 		}
 	}
 
 	return int(tag), nil
+}
+
+func (d *decoder) parseIFDColorMap(p []byte) error {
+	val, err := d.ifdUint(p, 3*256+1)
+	if err != nil {
+		return err
+	}
+	numcolors := len(val) / 3
+	if len(val)%3 != 0 || numcolors <= 0 || numcolors > 256 {
+		return FormatError("bad ColorMap length")
+	}
+	d.palette = make([]color.Color, numcolors)
+	for i := 0; i < numcolors; i++ {
+		d.palette[i] = color.RGBA64{
+			uint16(val[i]),
+			uint16(val[i+numcolors]),
+			uint16(val[i+2*numcolors]),
+			0xffff,
+		}
+	}
+	return nil
+}
+
+func (d *decoder) parseIFDSampleFormat(p []byte) error {
+	// Page 27 of the spec: If the SampleFormat is present and
+	// the value is not 1 [= unsigned integer data], a Baseline
+	// TIFF reader that cannot handle the SampleFormat value
+	// must terminate the import process gracefully.
+	val, err := d.ifdUint(p, 32)
+	if err != nil {
+		return err
+	}
+	for _, v := range val {
+		if v != 1 {
+			return UnsupportedError("sample format")
+		}
+	}
+	return nil
+}
+
+func (d *decoder) parseIFDJPEGTables(p []byte) error {
+	datatype := d.byteOrder.Uint16(p[2:4])
+	if dt := int(datatype); dt != 7 {
+		return UnsupportedError("IFD entry datatype")
+	}
+	size := d.byteOrder.Uint32(p[4:8])
+	if size < 4 {
+		return FormatError("bad JPEG tables")
+	}
+	var err error
+	d.tables, err = safeReadAt(d.r, uint64(size-4), int64(d.byteOrder.Uint32(p[8:12]))+2)
+	return err
 }
 
 // readBits reads n bits from the internal buffer starting at the current offset.
@@ -325,8 +339,7 @@ func maxInt() int {
 	return int(^uint(0) >> 1)
 }
 
-// maxBytesPerPixel is the maximum possible bytes-per-pixel, used for
-// conservative bounds checking.
+// maxBytesPerPixel is the maximum possible bytes-per-pixel, used for conservative bounds checking.
 const maxBytesPerPixel = 8
 
 func checkedMul3(a, b, c int) (int64, bool) {
@@ -343,210 +356,261 @@ func checkedMul3(a, b, c int) (int64, bool) {
 	return int64(ab * c), true
 }
 
-// decode decodes the raw data of an image.
-// It reads from d.buf and writes the strip or tile into dst.
-func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
-	d.off = 0
-
-	// Apply horizontal predictor if necessary.
-	// In this case, p contains the color difference to the preceding pixel.
-	// See page 64-65 of the spec.
-	if d.firstVal(tPredictor) == prHorizontal {
-		switch d.bpp {
-		case 16:
-			var off int
-			n := 2 * len(d.features[tBitsPerSample]) // bytes per sample times samples per pixel
-			for y := ymin; y < ymax; y++ {
-				off += n
-				for x := 0; x < (xmax-xmin-1)*n; x += 2 {
-					if off+2 > len(d.buf) {
-						return errNoPixels
-					}
-					v0 := d.byteOrder.Uint16(d.buf[off-n : off-n+2])
-					v1 := d.byteOrder.Uint16(d.buf[off : off+2])
-					d.byteOrder.PutUint16(d.buf[off:off+2], v1+v0)
-					off += 2
-				}
+func (d *decoder) applyPredictor16(xmin, ymin, xmax, ymax int) error {
+	var off int
+	n := 2 * len(d.features[tBitsPerSample]) // bytes per sample times samples per pixel
+	for y := ymin; y < ymax; y++ {
+		off += n
+		for x := 0; x < (xmax-xmin-1)*n; x += 2 {
+			if off+2 > len(d.buf) {
+				return errNoPixels
 			}
-		case 8:
-			var off int
-			n := 1 * len(d.features[tBitsPerSample]) // bytes per sample times samples per pixel
-			for y := ymin; y < ymax; y++ {
-				off += n
-				for x := 0; x < (xmax-xmin-1)*n; x++ {
-					if off >= len(d.buf) {
-						return errNoPixels
-					}
-					d.buf[off] += d.buf[off-n]
-					off++
-				}
-			}
-		case 1:
-			return UnsupportedError("horizontal predictor with 1 BitsPerSample")
+			v0 := d.byteOrder.Uint16(d.buf[off-n : off-n+2])
+			v1 := d.byteOrder.Uint16(d.buf[off : off+2])
+			d.byteOrder.PutUint16(d.buf[off:off+2], v1+v0)
+			off += 2
 		}
 	}
+	return nil
+}
 
-	// Bytes in a full-width, single-component row, including right-edge tile padding.
-	rowBytes := int((int64(xmax-xmin)*int64(d.bpp) + 7) / 8)
-	rMaxX := minInt(xmax, dst.Bounds().Max.X)
-	rMaxY := minInt(ymax, dst.Bounds().Max.Y)
-	switch d.mode {
-	case mGray, mGrayInvert:
-		if d.bpp == 16 {
-			img := dst.(*image.Gray16)
-			for y := ymin; y < rMaxY; y++ {
-				for x := xmin; x < rMaxX; x++ {
-					if d.off+2 > len(d.buf) {
-						return errNoPixels
-					}
-					v := d.byteOrder.Uint16(d.buf[d.off : d.off+2])
-					d.off += 2
-					if d.mode == mGrayInvert {
-						v = 0xffff - v
-					}
-					img.SetGray16(x, y, color.Gray16{v})
-				}
-				if rMaxX == img.Bounds().Max.X {
-					d.off += 2 * (xmax - img.Bounds().Max.X)
-				}
+func (d *decoder) applyPredictor8(xmin, ymin, xmax, ymax int) error {
+	var off int
+	n := len(d.features[tBitsPerSample]) // bytes per sample times samples per pixel
+	for y := ymin; y < ymax; y++ {
+		off += n
+		for x := 0; x < (xmax-xmin-1)*n; x++ {
+			if off >= len(d.buf) {
+				return errNoPixels
 			}
-		} else {
-			img := dst.(*image.Gray)
-			max := uint32((1 << d.bpp) - 1)
-			for y := ymin; y < rMaxY; y++ {
-				d.off = (y - ymin) * rowBytes
-				d.flushBits()
-				for x := xmin; x < rMaxX; x++ {
-					v, ok := d.readBits(d.bpp)
-					if !ok {
-						return errNoPixels
-					}
-					v = v * 0xff / max
-					if d.mode == mGrayInvert {
-						v = 0xff - v
-					}
-					img.SetGray(x, y, color.Gray{uint8(v)})
+			d.buf[off] += d.buf[off-n]
+			off++
+		}
+	}
+	return nil
+}
+
+// applyPredictor reverses the horizontal differences in d.buf; see pages 64-65 of the specification.
+func (d *decoder) applyPredictor(xmin, ymin, xmax, ymax int) error {
+	if d.firstVal(tPredictor) != prHorizontal {
+		return nil
+	}
+	switch d.bpp {
+	case 16:
+		return d.applyPredictor16(xmin, ymin, xmax, ymax)
+	case 8:
+		return d.applyPredictor8(xmin, ymin, xmax, ymax)
+	case 1:
+		return UnsupportedError("horizontal predictor with 1 BitsPerSample")
+	}
+	return nil
+}
+
+type decodeRegion struct {
+	xmin, ymin, xmax, rMaxX, rMaxY, rowBytes int
+}
+
+func (d *decoder) decodeGrayPixels(dst image.Image, region decodeRegion) error {
+	if d.bpp == 16 {
+		img := dst.(*image.Gray16)
+		for y := region.ymin; y < region.rMaxY; y++ {
+			for x := region.xmin; x < region.rMaxX; x++ {
+				if d.off+2 > len(d.buf) {
+					return errNoPixels
 				}
+				v := d.byteOrder.Uint16(d.buf[d.off : d.off+2])
+				d.off += 2
+				if d.mode == mGrayInvert {
+					v = 0xffff - v
+				}
+				img.SetGray16(x, y, color.Gray16{v})
+			}
+			if region.rMaxX == img.Bounds().Max.X {
+				d.off += 2 * (region.xmax - img.Bounds().Max.X)
 			}
 		}
-	case mPaletted:
-		img := dst.(*image.Paletted)
-		for y := ymin; y < rMaxY; y++ {
-			d.off = (y - ymin) * rowBytes
+	} else {
+		img := dst.(*image.Gray)
+		max := uint32((1 << d.bpp) - 1)
+		for y := region.ymin; y < region.rMaxY; y++ {
+			d.off = (y - region.ymin) * region.rowBytes
 			d.flushBits()
-			for x := xmin; x < rMaxX; x++ {
+			for x := region.xmin; x < region.rMaxX; x++ {
 				v, ok := d.readBits(d.bpp)
 				if !ok {
 					return errNoPixels
 				}
-				img.SetColorIndex(x, y, uint8(v))
+				v = v * 0xff / max
+				if d.mode == mGrayInvert {
+					v = 0xff - v
+				}
+				img.SetGray(x, y, color.Gray{uint8(v)})
 			}
 		}
-	case mRGB:
-		if d.bpp == 16 {
-			img := dst.(*image.RGBA64)
-			for y := ymin; y < rMaxY; y++ {
-				d.off = (y - ymin) * rowBytes * 3
-				for x := xmin; x < rMaxX; x++ {
-					if d.off+6 > len(d.buf) {
-						return errNoPixels
-					}
-					r := d.byteOrder.Uint16(d.buf[d.off+0 : d.off+2])
-					g := d.byteOrder.Uint16(d.buf[d.off+2 : d.off+4])
-					b := d.byteOrder.Uint16(d.buf[d.off+4 : d.off+6])
-					d.off += 6
-					img.SetRGBA64(x, y, color.RGBA64{r, g, b, 0xffff})
-				}
+	}
+	return nil
+}
+
+func (d *decoder) decodePalettedPixels(dst image.Image, region decodeRegion) error {
+	img := dst.(*image.Paletted)
+	for y := region.ymin; y < region.rMaxY; y++ {
+		d.off = (y - region.ymin) * region.rowBytes
+		d.flushBits()
+		for x := region.xmin; x < region.rMaxX; x++ {
+			v, ok := d.readBits(d.bpp)
+			if !ok {
+				return errNoPixels
 			}
-		} else {
-			img := dst.(*image.RGBA)
-			for y := ymin; y < rMaxY; y++ {
-				min := img.PixOffset(xmin, y)
-				max := img.PixOffset(rMaxX, y)
-				off := (y - ymin) * (xmax - xmin) * 3
-				for i := min; i < max; i += 4 {
-					if off+3 > len(d.buf) {
-						return errNoPixels
-					}
-					img.Pix[i+0] = d.buf[off+0]
-					img.Pix[i+1] = d.buf[off+1]
-					img.Pix[i+2] = d.buf[off+2]
-					img.Pix[i+3] = 0xff
-					off += 3
-				}
-			}
+			img.SetColorIndex(x, y, uint8(v))
 		}
-	case mNRGBA:
-		if d.bpp == 16 {
-			img := dst.(*image.NRGBA64)
-			for y := ymin; y < rMaxY; y++ {
-				d.off = (y - ymin) * rowBytes * 4
-				for x := xmin; x < rMaxX; x++ {
-					if d.off+8 > len(d.buf) {
-						return errNoPixels
-					}
-					r := d.byteOrder.Uint16(d.buf[d.off+0 : d.off+2])
-					g := d.byteOrder.Uint16(d.buf[d.off+2 : d.off+4])
-					b := d.byteOrder.Uint16(d.buf[d.off+4 : d.off+6])
-					a := d.byteOrder.Uint16(d.buf[d.off+6 : d.off+8])
-					d.off += 8
-					img.SetNRGBA64(x, y, color.NRGBA64{r, g, b, a})
-				}
-			}
-		} else {
-			img := dst.(*image.NRGBA)
-			for y := ymin; y < rMaxY; y++ {
-				min := img.PixOffset(xmin, y)
-				max := img.PixOffset(rMaxX, y)
-				i0, i1 := (y-ymin)*(xmax-xmin)*4, (y-ymin+1)*(xmax-xmin)*4
-				if i1 > len(d.buf) {
+	}
+	return nil
+}
+
+func (d *decoder) decodeRGBPixels(dst image.Image, region decodeRegion) error {
+	if d.bpp == 16 {
+		img := dst.(*image.RGBA64)
+		for y := region.ymin; y < region.rMaxY; y++ {
+			d.off = (y - region.ymin) * region.rowBytes * 3
+			for x := region.xmin; x < region.rMaxX; x++ {
+				if d.off+6 > len(d.buf) {
 					return errNoPixels
 				}
-				copy(img.Pix[min:max], d.buf[i0:i1])
+				r := d.byteOrder.Uint16(d.buf[d.off+0 : d.off+2])
+				g := d.byteOrder.Uint16(d.buf[d.off+2 : d.off+4])
+				b := d.byteOrder.Uint16(d.buf[d.off+4 : d.off+6])
+				d.off += 6
+				img.SetRGBA64(x, y, color.RGBA64{r, g, b, 0xffff})
 			}
 		}
-	case mRGBA:
-		if d.bpp == 16 {
-			img := dst.(*image.RGBA64)
-			for y := ymin; y < rMaxY; y++ {
-				d.off = (y - ymin) * rowBytes * 4
-				for x := xmin; x < rMaxX; x++ {
-					if d.off+8 > len(d.buf) {
-						return errNoPixels
-					}
-					r := d.byteOrder.Uint16(d.buf[d.off+0 : d.off+2])
-					g := d.byteOrder.Uint16(d.buf[d.off+2 : d.off+4])
-					b := d.byteOrder.Uint16(d.buf[d.off+4 : d.off+6])
-					a := d.byteOrder.Uint16(d.buf[d.off+6 : d.off+8])
-					d.off += 8
-					img.SetRGBA64(x, y, color.RGBA64{r, g, b, a})
-				}
-			}
-		} else {
-			img := dst.(*image.RGBA)
-			for y := ymin; y < rMaxY; y++ {
-				min := img.PixOffset(xmin, y)
-				max := img.PixOffset(rMaxX, y)
-				i0, i1 := (y-ymin)*(xmax-xmin)*4, (y-ymin+1)*(xmax-xmin)*4
-				if i1 > len(d.buf) {
+	} else {
+		img := dst.(*image.RGBA)
+		for y := region.ymin; y < region.rMaxY; y++ {
+			min := img.PixOffset(region.xmin, y)
+			max := img.PixOffset(region.rMaxX, y)
+			off := (y - region.ymin) * (region.xmax - region.xmin) * 3
+			for i := min; i < max; i += 4 {
+				if off+3 > len(d.buf) {
 					return errNoPixels
 				}
-				copy(img.Pix[min:max], d.buf[i0:i1])
+				img.Pix[i+0] = d.buf[off+0]
+				img.Pix[i+1] = d.buf[off+1]
+				img.Pix[i+2] = d.buf[off+2]
+				img.Pix[i+3] = 0xff
+				off += 3
 			}
 		}
-	case mCMYK:
-		// d.bpp must be 8
-		img := dst.(*image.CMYK)
-		for y := ymin; y < rMaxY; y++ {
-			min := img.PixOffset(xmin, y)
-			max := img.PixOffset(rMaxX, y)
-			i0, i1 := (y-ymin)*(xmax-xmin)*4, (y-ymin+1)*(xmax-xmin)*4
+	}
+	return nil
+}
+
+func (d *decoder) decodeNRGBAPixels(dst image.Image, region decodeRegion) error {
+	if d.bpp == 16 {
+		img := dst.(*image.NRGBA64)
+		for y := region.ymin; y < region.rMaxY; y++ {
+			d.off = (y - region.ymin) * region.rowBytes * 4
+			for x := region.xmin; x < region.rMaxX; x++ {
+				if d.off+8 > len(d.buf) {
+					return errNoPixels
+				}
+				r := d.byteOrder.Uint16(d.buf[d.off+0 : d.off+2])
+				g := d.byteOrder.Uint16(d.buf[d.off+2 : d.off+4])
+				b := d.byteOrder.Uint16(d.buf[d.off+4 : d.off+6])
+				a := d.byteOrder.Uint16(d.buf[d.off+6 : d.off+8])
+				d.off += 8
+				img.SetNRGBA64(x, y, color.NRGBA64{r, g, b, a})
+			}
+		}
+	} else {
+		img := dst.(*image.NRGBA)
+		for y := region.ymin; y < region.rMaxY; y++ {
+			min := img.PixOffset(region.xmin, y)
+			max := img.PixOffset(region.rMaxX, y)
+			i0, i1 := (y-region.ymin)*(region.xmax-region.xmin)*4, (y-region.ymin+1)*(region.xmax-region.xmin)*4
 			if i1 > len(d.buf) {
 				return errNoPixels
 			}
 			copy(img.Pix[min:max], d.buf[i0:i1])
 		}
+	}
+	return nil
+}
 
+func (d *decoder) decodeRGBAPixels(dst image.Image, region decodeRegion) error {
+	if d.bpp == 16 {
+		img := dst.(*image.RGBA64)
+		for y := region.ymin; y < region.rMaxY; y++ {
+			d.off = (y - region.ymin) * region.rowBytes * 4
+			for x := region.xmin; x < region.rMaxX; x++ {
+				if d.off+8 > len(d.buf) {
+					return errNoPixels
+				}
+				r := d.byteOrder.Uint16(d.buf[d.off+0 : d.off+2])
+				g := d.byteOrder.Uint16(d.buf[d.off+2 : d.off+4])
+				b := d.byteOrder.Uint16(d.buf[d.off+4 : d.off+6])
+				a := d.byteOrder.Uint16(d.buf[d.off+6 : d.off+8])
+				d.off += 8
+				img.SetRGBA64(x, y, color.RGBA64{r, g, b, a})
+			}
+		}
+	} else {
+		img := dst.(*image.RGBA)
+		for y := region.ymin; y < region.rMaxY; y++ {
+			min := img.PixOffset(region.xmin, y)
+			max := img.PixOffset(region.rMaxX, y)
+			i0, i1 := (y-region.ymin)*(region.xmax-region.xmin)*4, (y-region.ymin+1)*(region.xmax-region.xmin)*4
+			if i1 > len(d.buf) {
+				return errNoPixels
+			}
+			copy(img.Pix[min:max], d.buf[i0:i1])
+		}
+	}
+	return nil
+}
+
+func (d *decoder) decodeCMYKPixels(dst image.Image, region decodeRegion) error {
+	// d.bpp must be 8
+	img := dst.(*image.CMYK)
+	for y := region.ymin; y < region.rMaxY; y++ {
+		min := img.PixOffset(region.xmin, y)
+		max := img.PixOffset(region.rMaxX, y)
+		i0, i1 := (y-region.ymin)*(region.xmax-region.xmin)*4, (y-region.ymin+1)*(region.xmax-region.xmin)*4
+		if i1 > len(d.buf) {
+			return errNoPixels
+		}
+		copy(img.Pix[min:max], d.buf[i0:i1])
+	}
+	return nil
+}
+
+// decode decodes the raw data of an image.
+// It reads from d.buf and writes the strip or tile into dst.
+func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
+	d.off = 0
+	if err := d.applyPredictor(xmin, ymin, xmax, ymax); err != nil {
+		return err
+	}
+
+	// Bytes in a full-width, single-component row, including right-edge tile padding.
+	region := decodeRegion{
+		xmin: xmin, ymin: ymin, xmax: xmax,
+		rMaxX:    minInt(xmax, dst.Bounds().Max.X),
+		rMaxY:    minInt(ymax, dst.Bounds().Max.Y),
+		rowBytes: int((int64(xmax-xmin)*int64(d.bpp) + 7) / 8),
+	}
+	switch d.mode {
+	case mGray, mGrayInvert:
+		return d.decodeGrayPixels(dst, region)
+	case mPaletted:
+		return d.decodePalettedPixels(dst, region)
+	case mRGB:
+		return d.decodeRGBPixels(dst, region)
+	case mNRGBA:
+		return d.decodeNRGBAPixels(dst, region)
+	case mRGBA:
+		return d.decodeRGBAPixels(dst, region)
+	case mCMYK:
+		return d.decodeCMYKPixels(dst, region)
 	}
 
 	return nil
@@ -568,8 +632,7 @@ func newDecoderAt(r io.Reader, ifdOffset int64) (*decoder, error) {
 	return d, nil
 }
 
-// DecodeConfig returns the color model and dimensions of a TIFF image without
-// decoding the entire image.
+// DecodeConfig returns the color model and dimensions of a TIFF image without decoding the entire image.
 func DecodeConfig(r io.Reader) (image.Config, error) {
 	d, err := newDecoderAt(r, 0)
 	if err != nil {
@@ -578,8 +641,7 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 	return d.config, nil
 }
 
-// DecodeConfigAt returns the color model and dimensions of a TIFF image at ifdOffset without
-// decoding the entire image.
+// DecodeConfigAt returns the color model and dimensions of a TIFF image at ifdOffset without decoding the entire image.
 func DecodeConfigAt(r io.Reader, ifdOffset int64) (image.Config, error) {
 	d, err := newDecoderAt(r, ifdOffset)
 	if err != nil {
@@ -644,7 +706,7 @@ func (d *decoder) copyStrip(dst image.Image, strip image.Image, x, y int) {
 	}
 }
 
-func (d *decoder) prepJPEG(offset, n, lim int64, needAPP14, needTables bool) (io.Reader, error) {
+func (d *decoder) prepJPEG(offset, n, lim int64, needAPP14, needTables bool) (io.ReadSeeker, error) {
 	bb, err := safeReadAt(d.r, uint64(n), offset)
 	if err != nil {
 		return nil, err
@@ -685,8 +747,35 @@ func (d *decoder) prepJPEG(offset, n, lim int64, needAPP14, needTables bool) (io
 	return bytes.NewReader(bb), nil
 }
 
-func (d *decoder) decodeJPGOld(img image.Image, offset, n, lim int64, i, j, blockWidth, blockHeight int) error {
-	var rd io.Reader = io.NewSectionReader(d.r, offset, n)
+func (d *decoder) decodeJPEGBlock(img image.Image, rd io.ReadSeeker, x, y, width, height int) error {
+	c, err := jpeg.DecodeConfig(rd)
+	if err != nil {
+		return err
+	}
+	limit, ok := checkedMul3(width, height, maxBytesPerPixel)
+	if !ok || c.Width <= 0 || c.Height <= 0 {
+		return FormatError("invalid JPEG block dimensions")
+	}
+	size, ok := checkedMul3(c.Width, c.Height, maxBytesPerPixel)
+	if !ok || size > limit {
+		return FormatError("JPEG dimensions exceed TIFF block size")
+	}
+	if c.Width != width || c.Height != height {
+		return FormatError("JPEG dimensions do not match TIFF block")
+	}
+	if _, err := rd.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	decoded, _, err := image.Decode(rd)
+	if err != nil {
+		return err
+	}
+	d.copyStrip(img, decoded, x, y)
+	return nil
+}
+
+func (d *decoder) decodeJPGOld(img image.Image, offset, n, lim int64, x, y, width, height int) error {
+	var rd io.ReadSeeker = io.NewSectionReader(d.r, offset, n)
 	if len(d.features[tBitsPerSample]) == 4 && d.firstVal(tExtraSamples) > 0 {
 		var err error
 		rd, err = d.prepJPEG(offset, n, lim, true, false)
@@ -694,234 +783,272 @@ func (d *decoder) decodeJPGOld(img image.Image, offset, n, lim int64, i, j, bloc
 			return err
 		}
 	}
-	img0, _, err := image.Decode(rd)
-	if err != nil {
-		return err
+	return d.decodeJPEGBlock(img, rd, x, y, width, height)
+}
+
+type blockLayout struct {
+	width, height, across, down int
+	padding                     bool
+	offsets, counts             []uint
+}
+
+type tiffBlock struct {
+	offset, n           int64
+	x, y, width, height int
+}
+
+func (d *decoder) validateTileSize(width, height int) error {
+	if width < 8 || height < 8 {
+		return FormatError("tile size is too small")
 	}
-	d.copyStrip(img, img0, i*blockWidth, j*blockHeight)
+	if _, ok := checkedMul3(width, height, maxBytesPerPixel); !ok {
+		return FormatError("tile size is too large")
+	}
+	if width-d.config.Width > 16 || height-d.config.Height > 16 {
+		if width > 1024 || height > 1024 {
+			return FormatError("tile size exceeds image size")
+		}
+	}
 	return nil
 }
 
-func decode(d *decoder) (img image.Image, err error) {
-	blockPadding := false
-	blockWidth := d.config.Width
-	blockHeight := d.config.Height
-	blocksAcross := 1
-	blocksDown := 1
+func (d *decoder) tileLayout() (blockLayout, error) {
+	l := blockLayout{padding: true}
+	var err error
+	if l.width, err = d.firstIntVal(tTileWidth); err != nil {
+		return l, err
+	}
+	if l.height, err = d.firstIntVal(tTileLength); err != nil {
+		return l, err
+	}
+	if err := d.validateTileSize(l.width, l.height); err != nil {
+		return l, err
+	}
+	l.across = (d.config.Width + l.width - 1) / l.width
+	l.down = (d.config.Height + l.height - 1) / l.height
+	if l.offsets, err = d.parseIFDOffsets(tTileOffsets, l.across*l.down); err != nil {
+		return l, err
+	}
+	l.counts, err = d.parseIFDOffsets(tTileByteCounts, l.across*l.down)
+	return l, err
+}
 
+func (d *decoder) stripLayout() (blockLayout, error) {
+	l := blockLayout{width: d.config.Width, height: d.config.Height, across: 1, down: 1}
 	if d.config.Width == 0 {
-		blocksAcross = 0
+		l.across = 0
 	}
 	if d.config.Height == 0 {
-		blocksDown = 0
+		l.down = 0
 	}
+	if v := d.firstVal(tRowsPerStrip); v > 0 && v < uint(l.height) {
+		l.height = int(v)
+	}
+	if l.height != 0 {
+		l.down = (d.config.Height + l.height - 1) / l.height
+	}
+	var err error
+	if l.offsets, err = d.parseIFDOffsets(tStripOffsets, l.down); err != nil {
+		return l, err
+	}
+	l.counts, err = d.parseIFDOffsets(tStripByteCounts, l.down)
+	return l, err
+}
 
-	var blockOffsets, blockCounts []uint
-
+func (d *decoder) readBlockLayout() (blockLayout, error) {
+	var l blockLayout
+	var err error
 	if d.firstVal(tTileWidth) != 0 {
-		blockPadding = true
-
-		if blockWidth, err = d.firstIntVal(tTileWidth); err != nil {
-			return nil, err
-		}
-		if blockHeight, err = d.firstIntVal(tTileLength); err != nil {
-			return nil, err
-		}
-		if blockWidth < 8 || blockHeight < 8 {
-			return nil, FormatError("tile size is too small")
-		}
-		if _, ok := checkedMul3(blockWidth, blockHeight, maxBytesPerPixel); !ok {
-			return nil, FormatError("tile size is too large")
-		}
-		if blockWidth-d.config.Width > 16 || blockHeight-d.config.Height > 16 {
-			if blockWidth > 1024 || blockHeight > 1024 {
-				return nil, FormatError("tile size exceeds image size")
-			}
-		}
-
-		if blockWidth != 0 {
-			blocksAcross = (d.config.Width + blockWidth - 1) / blockWidth
-		}
-		if blockHeight != 0 {
-			blocksDown = (d.config.Height + blockHeight - 1) / blockHeight
-		}
-
-		blockOffsets, err = d.parseIFDOffsets(tTileOffsets, blocksAcross*blocksDown)
-		if err != nil {
-			return nil, err
-		}
-		blockCounts, err = d.parseIFDOffsets(tTileByteCounts, blocksAcross*blocksDown)
-		if err != nil {
-			return nil, err
-		}
-
+		l, err = d.tileLayout()
 	} else {
-		if v := d.firstVal(tRowsPerStrip); v > 0 && v < uint(blockHeight) {
-			blockHeight = int(v)
-		}
-
-		if blockHeight != 0 {
-			blocksDown = (d.config.Height + blockHeight - 1) / blockHeight
-		}
-
-		blockOffsets, err = d.parseIFDOffsets(tStripOffsets, blocksDown)
-		if err != nil {
-			return nil, err
-		}
-		blockCounts, err = d.parseIFDOffsets(tStripByteCounts, blocksDown)
-		if err != nil {
-			return nil, err
-		}
+		l, err = d.stripLayout()
 	}
-
+	if err != nil {
+		return l, err
+	}
 	// Check if we have the right number of strips/tiles, offsets and counts.
-	if n := blocksAcross * blocksDown; len(blockOffsets) < n || len(blockCounts) < n {
-		return nil, FormatError("inconsistent header")
+	if n := l.across * l.down; len(l.offsets) < n || len(l.counts) < n {
+		return l, FormatError("inconsistent header")
 	}
+	return l, nil
+}
 
-	imgRect := image.Rect(0, 0, d.config.Width, d.config.Height)
+func (d *decoder) newImage() image.Image {
+	rect := image.Rect(0, 0, d.config.Width, d.config.Height)
 	switch d.mode {
 	case mGray, mGrayInvert:
 		if d.bpp == 16 {
-			img = image.NewGray16(imgRect)
-		} else {
-			img = image.NewGray(imgRect)
+			return image.NewGray16(rect)
 		}
+		return image.NewGray(rect)
 	case mPaletted:
-		img = image.NewPaletted(imgRect, d.palette)
+		return image.NewPaletted(rect, d.palette)
 	case mNRGBA:
 		if d.bpp == 16 {
-			img = image.NewNRGBA64(imgRect)
-		} else {
-			img = image.NewNRGBA(imgRect)
+			return image.NewNRGBA64(rect)
 		}
+		return image.NewNRGBA(rect)
 	case mRGB, mRGBA:
 		if d.bpp == 16 {
-			img = image.NewRGBA64(imgRect)
-		} else {
-			img = image.NewRGBA(imgRect)
+			return image.NewRGBA64(rect)
 		}
+		return image.NewRGBA(rect)
 	case mCMYK:
-		img = image.NewCMYK(imgRect)
+		return image.NewCMYK(rect)
 	}
+	return nil
+}
 
-	if blocksAcross == 0 || blocksDown == 0 {
+func (d *decoder) loadUncompressedBlock(b tiffBlock, limit int64) error {
+	if b.n > limit {
+		return FormatError("block data size too large")
+	}
+	var err error
+	if r, ok := d.r.(*buffer); ok {
+		d.buf, err = r.Slice(int(b.offset), int(b.n))
+	} else {
+		d.buf, err = safeReadAt(d.r, uint64(b.n), b.offset)
+	}
+	return err
+}
+
+func (d *decoder) loadRLEBlock(b tiffBlock, limit int64) error {
+	if d.bpp != 1 {
+		return UnsupportedError("CCITT RLE with BitsPerSample != 1")
+	}
+	order := ccittFillOrder(d.firstVal(tFillOrder))
+	whiteIsZero := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
+	var err error
+	d.buf, err = decodeCCITTRLE(io.NewSectionReader(d.r, b.offset, b.n), order, b.width, b.height, whiteIsZero, limit)
+	return err
+}
+
+func (d *decoder) loadFaxBlock(b tiffBlock, limit int64, compression uint) error {
+	opts, err := d.ccittOptions(compression)
+	if err != nil {
+		return err
+	}
+	// LSBToMSB := d.firstVal(tFillOrder) == 2
+	// order := ccitt.MSB
+	// if LSBToMSB {
+	// 	order = ccitt.LSB
+	// }
+	order := ccittFillOrder(d.firstVal(tFillOrder))
+	subFormat := ccitt.Group3
+	if compression == cG4 {
+		subFormat = ccitt.Group4
+	}
+	r := ccitt.NewReader(io.NewSectionReader(d.r, b.offset, b.n), order, subFormat, b.width, b.height, opts)
+	d.buf, err = readBuf(r, d.buf, limit)
+	return err
+}
+
+func (d *decoder) loadLZWBlock(b tiffBlock, limit int64) error {
+	r := lzw.NewReader(io.NewSectionReader(d.r, b.offset, b.n), lzw.MSB, 8)
+	var err error
+	d.buf, err = readBuf(r, d.buf, limit)
+	r.Close()
+	return err
+}
+
+func (d *decoder) loadDeflateBlock(b tiffBlock, limit int64) error {
+	r, err := zlib.NewReader(io.NewSectionReader(d.r, b.offset, b.n))
+	if err != nil {
+		return err
+	}
+	d.buf, err = readBuf(r, d.buf, limit)
+	r.Close()
+	return err
+}
+
+func (d *decoder) loadBlockData(b tiffBlock, limit int64, compression uint) error {
+	switch compression {
+	// According to the spec, Compression does not have a default value,
+	// but some tools interpret a missing Compression value as none so we do
+	// the same.
+	case cNone, 0:
+		return d.loadUncompressedBlock(b, limit)
+	case cCCITT:
+		return d.loadRLEBlock(b, limit)
+	case cG3, cG4:
+		return d.loadFaxBlock(b, limit, compression)
+	case cLZW:
+		return d.loadLZWBlock(b, limit)
+	case cDeflate, cDeflateOld:
+		return d.loadDeflateBlock(b, limit)
+	case cPackBits:
+		var err error
+		d.buf, err = unpackBits(io.NewSectionReader(d.r, b.offset, b.n), limit)
+		return err
+	default:
+		return UnsupportedError(fmt.Sprintf("compression value %d", compression))
+	}
+}
+
+func (d *decoder) decodeCompressedJPEG(img image.Image, b tiffBlock, limit int64, compression uint) error {
+	if compression == cJPEGOld || len(d.tables) == 0 {
+		return d.decodeJPGOld(img, b.offset, b.n, limit, b.x, b.y, b.width, b.height)
+	}
+	needAPP14 := len(d.features[tBitsPerSample]) == 4 && d.firstVal(tExtraSamples) > 0
+	rd, err := d.prepJPEG(b.offset, b.n, limit, needAPP14, true)
+	if err != nil {
+		return err
+	}
+	return d.decodeJPEGBlock(img, rd, b.x, b.y, b.width, b.height)
+}
+
+func (d *decoder) decodeBlock(img image.Image, b tiffBlock, limit int64) error {
+	compression := d.firstVal(tCompression)
+	if compression == cJPEGOld || compression == cJPEG {
+		return d.decodeCompressedJPEG(img, b, limit, compression)
+	}
+	if err := d.loadBlockData(b, limit, compression); err != nil {
+		return err
+	}
+	return d.decode(img, b.x, b.y, b.x+b.width, b.y+b.height)
+}
+
+func (d *decoder) decodeBlocks(img image.Image, l blockLayout, limit int64) error {
+	for i := 0; i < l.across; i++ {
+		width := l.width
+		if !l.padding && i == l.across-1 && d.config.Width%l.width != 0 {
+			width = d.config.Width % l.width
+		}
+		for j := 0; j < l.down; j++ {
+			height := l.height
+			if !l.padding && j == l.down-1 && d.config.Height%l.height != 0 {
+				height = d.config.Height % l.height
+			}
+			index := j*l.across + i
+			b := tiffBlock{
+				offset: int64(l.offsets[index]), n: int64(l.counts[index]),
+				x: i * l.width, y: j * l.height, width: width, height: height,
+			}
+			if err := d.decodeBlock(img, b, limit); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func decode(d *decoder) (image.Image, error) {
+	l, err := d.readBlockLayout()
+	if err != nil {
+		return nil, err
+	}
+	img := d.newImage()
+	if l.across == 0 || l.down == 0 {
 		return img, nil
 	}
-	blockMaxDataSize, ok := checkedMul3(blockWidth, blockHeight, maxBytesPerPixel)
+	limit, ok := checkedMul3(l.width, l.height, maxBytesPerPixel)
 	if !ok {
 		return nil, FormatError("block data size too large")
 	}
-
-	for i := 0; i < blocksAcross; i++ {
-		blkW := blockWidth
-		if !blockPadding && i == blocksAcross-1 && d.config.Width%blockWidth != 0 {
-			blkW = d.config.Width % blockWidth
-		}
-		for j := 0; j < blocksDown; j++ {
-			blkH := blockHeight
-			if !blockPadding && j == blocksDown-1 && d.config.Height%blockHeight != 0 {
-				blkH = d.config.Height % blockHeight
-			}
-			offset := int64(blockOffsets[j*blocksAcross+i])
-			n := int64(blockCounts[j*blocksAcross+i])
-			// LSBToMSB := d.firstVal(tFillOrder) == 2
-			// order := ccitt.MSB
-			// if LSBToMSB {
-			// 	order = ccitt.LSB
-			// }
-			switch d.firstVal(tCompression) {
-
-			// According to the spec, Compression does not have a default value,
-			// but some tools interpret a missing Compression value as none so we do
-			// the same.
-			case cNone, 0:
-				if n > blockMaxDataSize {
-					return nil, FormatError("block data size too large")
-				}
-				if b, ok := d.r.(*buffer); ok {
-					d.buf, err = b.Slice(int(offset), int(n))
-				} else {
-					d.buf, err = safeReadAt(d.r, uint64(n), offset)
-				}
-			case cCCITT:
-				if d.bpp != 1 {
-					return nil, UnsupportedError("CCITT RLE with BitsPerSample != 1")
-				}
-				order := ccittFillOrder(d.firstVal(tFillOrder))
-				whiteIsZero := d.firstVal(tPhotometricInterpretation) == pWhiteIsZero
-				d.buf, err = decodeCCITTRLE(io.NewSectionReader(d.r, offset, n), order, blkW, blkH, whiteIsZero, blockMaxDataSize)
-			case cG3:
-				opts, err := d.ccittOptions(cG3)
-				if err != nil {
-					return nil, err
-				}
-				order := ccittFillOrder(d.firstVal(tFillOrder))
-				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group3, blkW, blkH, opts)
-				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
-			case cG4:
-				opts, err := d.ccittOptions(cG4)
-				if err != nil {
-					return nil, err
-				}
-				order := ccittFillOrder(d.firstVal(tFillOrder))
-				r := ccitt.NewReader(io.NewSectionReader(d.r, offset, n), order, ccitt.Group4, blkW, blkH, opts)
-				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
-			case cLZW:
-				r := lzw.NewReader(io.NewSectionReader(d.r, offset, n), lzw.MSB, 8)
-				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
-				r.Close()
-			case cDeflate, cDeflateOld:
-				var r io.ReadCloser
-				r, err = zlib.NewReader(io.NewSectionReader(d.r, offset, n))
-				if err != nil {
-					return nil, err
-				}
-				d.buf, err = readBuf(r, d.buf, blockMaxDataSize)
-				r.Close()
-			case cJPEGOld:
-				if err := d.decodeJPGOld(img, offset, n, blockMaxDataSize, i, j, blockWidth, blockHeight); err != nil {
-					return nil, err
-				}
-				continue
-			case cJPEG:
-				if len(d.tables) == 0 {
-					if err := d.decodeJPGOld(img, offset, n, blockMaxDataSize, i, j, blockWidth, blockHeight); err != nil {
-						return nil, err
-					}
-					continue
-				}
-				needAPP14 := len(d.features[tBitsPerSample]) == 4 && d.firstVal(tExtraSamples) > 0
-				rd, err := d.prepJPEG(offset, n, blockMaxDataSize, needAPP14, true)
-				if err != nil {
-					return nil, err
-				}
-				img0, _, err := image.Decode(rd)
-				if err != nil {
-					return nil, err
-				}
-				d.copyStrip(img, img0, i*blockWidth, j*blockHeight)
-				continue
-			case cPackBits:
-				d.buf, err = unpackBits(io.NewSectionReader(d.r, offset, n), blockMaxDataSize)
-			default:
-				err = UnsupportedError(fmt.Sprintf("compression value %d", d.firstVal(tCompression)))
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			xmin := i * blockWidth
-			ymin := j * blockHeight
-			xmax := xmin + blkW
-			ymax := ymin + blkH
-			err = d.decode(img, xmin, ymin, xmax, ymax)
-			if err != nil {
-				return nil, err
-			}
-		}
+	if err := d.decodeBlocks(img, l, limit); err != nil {
+		return nil, err
 	}
-	return
+	return img, nil
 }
 
 func readBuf(r io.Reader, buf []byte, lim int64) ([]byte, error) {

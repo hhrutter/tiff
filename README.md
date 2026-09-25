@@ -1,12 +1,45 @@
- # Note
+# tiff
 
-This package is an improved version of [x/image/tiff](https://github.com/golang/image/tree/master/tiff) featuring:
+This package extends [golang.org/x/image/tiff](https://github.com/golang/image/tree/master/tiff) with additional
+compression, color, and multi-page support. It grew out of [pdfcpu](https://github.com/pdfcpu/pdfcpu)'s need to process
+TIFF images, including monochrome CCITT and CMYK images.
 
-* Read support for CCITT Group3/4 compressed images using [x/image/ccitt](https://github.com/golang/image/tree/master/ccitt)
-* Read/write support for LZW compressed images.
-* Read/write support for the CMYK color model.
-* Read support for JPEG compressed images.
-* Read support for multi page TIFF files.
+## Compression support
+
+| Compression | Decode | Encode |
+| --- | --- | --- |
+| Uncompressed | Yes | Yes |
+| PackBits | Yes | No |
+| Deflate, including the legacy tag when decoding | Yes | Yes |
+| LZW | Yes | Yes |
+| CCITT RLE (Modified Huffman) | Yes | No |
+| CCITT Group 3 (1-D) and Group 4 | Yes | No |
+| JPEG (compression 6 and 7) | Yes | No |
+
+Group 3 and Group 4 decoding uses [x/image/ccitt](https://github.com/golang/image/tree/master/ccitt). Group 3
+byte-aligned data is supported. Group 3 2-D and uncompressed modes, and the Group 4 uncompressed mode, return an
+error. LZW decoding uses [x/image/tiff/lzw](https://github.com/golang/image/tree/master/tiff/lzw); encoding uses
+this package's TIFF LZW writer. The former `hhrutter/lzw` dependency is no longer needed.
+
+## Images and pages
+
+The package reads and writes 8-bit CMYK images. It also decodes four-component RGB images whose `ExtraSamples` tag is
+absent or unspecified as associated-alpha RGBA. Padded edge tiles are decoded with their full tile dimensions while only
+visible pixels are copied into the image, including packed and 16-bit samples.
+
+`Encode` writes one image; `EncodeAll` writes multiple pages with linked Image File Directories (IFDs). `Decode` and
+`DecodeConfig` use the first IFD. `DecodeAt` and `DecodeConfigAt` read an IFD at a supplied byte offset; the offset is
+not a page number. The writer supports horizontal prediction with LZW and Deflate.
+
+## Decoder checks
+
+The decoder caps parsed IFD value counts and uses checked block sizes to bound decompressed buffers. For an input that
+only implements `io.Reader`, the buffered `io.ReaderAt` adapter grows as bytes arrive and returns errors for invalid
+offsets and short reads.
+Before a JPEG strip or tile is fully decoded, its frame dimensions are checked against the expected TIFF
+block, including short final strips, padded edge tiles, and streams prepared with APP14 or `JPEGTables`.
+These checks do not impose an absolute image-size cap; the destination image is allocated from the TIFF dimensions.
+IFD parsing, pixel conversion, and compression dispatch are kept in focused helpers.
 
 ## YCbCr JPEG decoding
 
@@ -22,18 +55,3 @@ The standard defaults apply when these fields or `PlanarConfiguration` are absen
 
 Other compression methods for YCbCr, separate component planes, extra components, other color conversion parameters,
 and other JPEG processes return an error. Applications do not need to import `image/jpeg` separately.
-
-
-## Background
-
-Working on [pdfcpu](https://github.com/pdfcpu/pdfcpu) (a PDF processor) created a need for processing TIFF files and LZW compression.
-
-1) CCITT compression for monochrome images was the first need. This is being addressed as part of ongoing work on [x/image/ccitt](https://github.com/golang/image/tree/master/ccitt).
-
-2) TIFF LZW compression uses MSB bit order, 8-bit literal codes, and TIFF's code-width transition behavior.
-
-3) The PDF specification defines a CMYK color space. This is currently not supported at [x/image/tiff](https://github.com/golang/image/tree/master/tiff).
-
-## Goal
-
-An improved version of [x/image/tiff](https://github.com/golang/image/tree/master/tiff) with full read/write support for CCITT, LZW, JPEG compression and the CMYK color model.
