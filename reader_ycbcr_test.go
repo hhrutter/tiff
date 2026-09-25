@@ -57,7 +57,7 @@ func jpegTestRational(order binary.ByteOrder, values ...uint32) jpegTestField {
 	return f
 }
 
-func encodeTestJPEG(t *testing.T, w, h, index int) []byte {
+func encodeTestJPEG(t testing.TB, w, h, index int) []byte {
 	t.Helper()
 	im := image.NewRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
@@ -92,7 +92,7 @@ func splitTestJPEG(b []byte) ([]byte, []byte) {
 	return append(tables, 0xff, 0xd9), segment
 }
 
-func jpegTestSegments(t *testing.T, s jpegTestSpec) ([][]byte, *image.RGBA) {
+func jpegTestSegments(t testing.TB, s jpegTestSpec) ([][]byte, *image.RGBA) {
 	t.Helper()
 	want := image.NewRGBA(image.Rect(0, 0, s.w, s.h))
 	var parts [][]byte
@@ -132,7 +132,7 @@ func jpegTestFields(s jpegTestSpec) map[int]jpegTestField {
 	}
 }
 
-func jpegTestTIFF(t *testing.T, s jpegTestSpec) ([]byte, *image.RGBA) {
+func jpegTestTIFF(t testing.TB, s jpegTestSpec) ([]byte, *image.RGBA) {
 	t.Helper()
 	if s.order == nil {
 		s.order = binary.LittleEndian

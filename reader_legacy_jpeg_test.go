@@ -76,7 +76,7 @@ func legacyJPEGFields(s legacyJPEGSpec, offsets, counts []uint32) []legacyJPEGFi
 	return f
 }
 
-func legacyJPEGFixture(t *testing.T, s legacyJPEGSpec) []byte {
+func legacyJPEGFixture(t testing.TB, s legacyJPEGSpec) []byte {
 	t.Helper()
 	across, down := 1, (s.height+s.blockHeight-1)/s.blockHeight
 	if s.tiled {
@@ -118,7 +118,7 @@ func legacyJPEGFixture(t *testing.T, s legacyJPEGSpec) []byte {
 	return b
 }
 
-func legacyTestJPEG(t *testing.T, width, height int) []byte {
+func legacyTestJPEG(t testing.TB, width, height int) []byte {
 	t.Helper()
 	im := image.NewRGBA(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {
@@ -133,7 +133,7 @@ func legacyTestJPEG(t *testing.T, width, height int) []byte {
 	return b.Bytes()
 }
 
-func legacyJPEGDimensions(t *testing.T, b []byte, width, height uint16) []byte {
+func legacyJPEGDimensions(t testing.TB, b []byte, width, height uint16) []byte {
 	t.Helper()
 	b = append([]byte(nil), b...)
 	for pos := 2; pos+4 < len(b); {
