@@ -21,8 +21,8 @@ import (
 	"io"
 	"math"
 
+	"github.com/hhrutter/tiff/internal/lzw"
 	"golang.org/x/image/ccitt"
-	"golang.org/x/image/tiff/lzw"
 )
 
 // A FormatError reports that the input is not a valid TIFF image.
@@ -944,11 +944,23 @@ func (d *decoder) loadFaxBlock(b tiffBlock, limit int64, compression uint) error
 }
 
 func (d *decoder) loadLZWBlock(b tiffBlock, limit int64) error {
-	r := lzw.NewReader(io.NewSectionReader(d.r, b.offset, b.n), lzw.MSB, 8)
+	r := lzw.NewReader(io.NewSectionReader(d.r, b.offset, b.n))
 	var err error
-	d.buf, err = readBuf(r, d.buf, limit)
+	d.buf, err = readBuf(r, d.buf, d.lzwBlockDataSize(b, limit))
 	r.Close()
 	return err
+}
+
+func (d *decoder) lzwBlockDataSize(b tiffBlock, limit int64) int64 {
+	rowBits, ok := checkedMul3(b.width, len(d.features[tBitsPerSample]), int(d.bpp))
+	if !ok || rowBits <= 0 || rowBits > int64(maxInt()-7) {
+		return limit
+	}
+	rowBytes := (rowBits + 7) / 8
+	if b.height <= 0 || int64(b.height) > limit/rowBytes {
+		return limit
+	}
+	return rowBytes * int64(b.height)
 }
 
 func (d *decoder) loadDeflateBlock(b tiffBlock, limit int64) error {
