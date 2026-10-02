@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"math"
 	"sort"
 )
 
@@ -62,7 +63,21 @@ type encodedImage struct {
 	ifd  []ifdEntry
 }
 
+func writeBytes(w io.Writer, p []byte) error {
+	n, err := w.Write(p)
+	if err != nil {
+		return err
+	}
+	if n != len(p) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
 func encodeGray(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) error {
+	if dx == 0 || dy == 0 {
+		return nil
+	}
 	if !predictor {
 		return writePix(w, pix, dy, dx, stride)
 	}
@@ -78,7 +93,7 @@ func encodeGray(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) er
 			v0 = v1
 			off++
 		}
-		if _, err := w.Write(buf); err != nil {
+		if err := writeBytes(w, buf); err != nil {
 			return err
 		}
 	}
@@ -86,6 +101,9 @@ func encodeGray(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) er
 }
 
 func encodeGray16(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) error {
+	if dx == 0 || dy == 0 {
+		return nil
+	}
 	buf := make([]byte, dx*2)
 	for y := 0; y < dy; y++ {
 		min := y*stride + 0
@@ -103,7 +121,7 @@ func encodeGray16(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) 
 			buf[off+1] = byte(v1 >> 8)
 			off += 2
 		}
-		if _, err := w.Write(buf); err != nil {
+		if err := writeBytes(w, buf); err != nil {
 			return err
 		}
 	}
@@ -111,6 +129,9 @@ func encodeGray16(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) 
 }
 
 func encodeRGBA(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) error {
+	if dx == 0 || dy == 0 {
+		return nil
+	}
 	if !predictor {
 		return writePix(w, pix, dy, dx*4, stride)
 	}
@@ -129,7 +150,7 @@ func encodeRGBA(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) er
 			off += 4
 			r0, g0, b0, a0 = r1, g1, b1, a1
 		}
-		if _, err := w.Write(buf); err != nil {
+		if err := writeBytes(w, buf); err != nil {
 			return err
 		}
 	}
@@ -137,6 +158,9 @@ func encodeRGBA(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) er
 }
 
 func encodeRGBA64(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) error {
+	if dx == 0 || dy == 0 {
+		return nil
+	}
 	buf := make([]byte, dx*8)
 	for y := 0; y < dy; y++ {
 		min := y*stride + 0
@@ -166,7 +190,7 @@ func encodeRGBA64(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) 
 			buf[off+7] = byte(a1 >> 8)
 			off += 8
 		}
-		if _, err := w.Write(buf); err != nil {
+		if err := writeBytes(w, buf); err != nil {
 			return err
 		}
 	}
@@ -174,6 +198,9 @@ func encodeRGBA64(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) 
 }
 
 func encodeCMYK(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) error {
+	if dx == 0 || dy == 0 {
+		return nil
+	}
 	if !predictor {
 		return writePix(w, pix, dy, dx*4, stride)
 	}
@@ -192,7 +219,7 @@ func encodeCMYK(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) er
 			off += 4
 			c0, m0, y0, k0 = c1, m1, y1, k1
 		}
-		if _, err := w.Write(buf); err != nil {
+		if err := writeBytes(w, buf); err != nil {
 			return err
 		}
 	}
@@ -201,6 +228,9 @@ func encodeCMYK(w io.Writer, pix []uint8, dx, dy, stride int, predictor bool) er
 
 func encode(w io.Writer, m image.Image, predictor bool) error {
 	bounds := m.Bounds()
+	if bounds.Min.X == bounds.Max.X || bounds.Min.Y == bounds.Max.Y {
+		return nil
+	}
 	buf := make([]byte, 4*bounds.Dx())
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		off := 0
@@ -229,7 +259,7 @@ func encode(w io.Writer, m image.Image, predictor bool) error {
 				off += 4
 			}
 		}
-		if _, err := w.Write(buf); err != nil {
+		if err := writeBytes(w, buf); err != nil {
 			return err
 		}
 	}
@@ -241,11 +271,10 @@ func encode(w io.Writer, m image.Image, predictor bool) error {
 // corresponds to one of the TIFF image types.
 func writePix(w io.Writer, pix []byte, nrows, length, stride int) error {
 	if length == stride {
-		_, err := w.Write(pix[:nrows*length])
-		return err
+		return writeBytes(w, pix[:nrows*length])
 	}
 	for ; nrows > 0; nrows-- {
-		if _, err := w.Write(pix[:length]); err != nil {
+		if err := writeBytes(w, pix[:length]); err != nil {
 			return err
 		}
 		pix = pix[stride:]
@@ -253,14 +282,66 @@ func writePix(w io.Writer, pix []byte, nrows, length, stride int) error {
 	return nil
 }
 
-func marshalIFD(ifdOffset, nextIFDOffset uint32, d []ifdEntry) ([]byte, error) {
-	var out bytes.Buffer
+func ifdEntrySize(ent ifdEntry) (uint32, uint64, error) {
+	if ent.tag < 0 || ent.tag > math.MaxUint16 {
+		return 0, 0, errors.New("tiff: invalid IFD tag")
+	}
+	if ent.datatype <= 0 || ent.datatype >= len(lengths) {
+		return 0, 0, errors.New("tiff: invalid IFD datatype")
+	}
+	if ent.datatype == dtRational && len(ent.data)%2 != 0 {
+		return 0, 0, errors.New("tiff: invalid rational IFD data")
+	}
+	count := uint64(len(ent.data))
+	if ent.datatype == dtRational {
+		count /= 2
+	}
+	if count > math.MaxUint32 {
+		return 0, 0, errors.New("tiff: too many IFD values")
+	}
+	datalen := count * uint64(lengths[ent.datatype])
+	if datalen > uint64(maxInt()) {
+		return 0, 0, errors.New("tiff: IFD data too large")
+	}
+	return uint32(count), datalen, nil
+}
+
+func marshalIFDEntry(ent ifdEntry, pstart uint64, parea *[]byte) ([ifdLen]byte, error) {
 	var buf [ifdLen]byte
-	// Make space for "pointer area" containing IFD entry data
-	// longer than 4 bytes.
-	parea := make([]byte, 1024)
-	pstart := int(ifdOffset) + ifdLen*len(d) + 6
-	var o int // Current offset in parea.
+	count, datalen, err := ifdEntrySize(ent)
+	if err != nil {
+		return buf, err
+	}
+	enc.PutUint16(buf[0:2], uint16(ent.tag))
+	enc.PutUint16(buf[2:4], uint16(ent.datatype))
+	enc.PutUint32(buf[4:8], count)
+	if datalen <= 4 {
+		ent.putData(buf[8:12])
+		return buf, nil
+	}
+
+	pointer := pstart + uint64(len(*parea))
+	if err := checkClassicTIFFOffset(pointer); err != nil || datalen > math.MaxUint32-pointer {
+		return buf, errors.New("tiff: file too large for classic TIFF offsets")
+	}
+	o := len(*parea)
+	*parea = append(*parea, make([]byte, int(datalen))...)
+	ent.putData((*parea)[o:])
+	enc.PutUint32(buf[8:12], uint32(pointer))
+	return buf, nil
+}
+
+func marshalIFD(ifdOffset, nextIFDOffset uint32, d []ifdEntry) ([]byte, error) {
+	if len(d) > math.MaxUint16 {
+		return nil, errors.New("tiff: too many IFD entries")
+	}
+	pstart := uint64(ifdOffset) + uint64(ifdLen)*uint64(len(d)) + 6
+	if err := checkClassicTIFFOffset(pstart); err != nil {
+		return nil, err
+	}
+
+	var out bytes.Buffer
+	var parea []byte
 
 	// The IFD has to be written with the tags in ascending order.
 	d = append([]ifdEntry(nil), d...)
@@ -271,29 +352,9 @@ func marshalIFD(ifdOffset, nextIFDOffset uint32, d []ifdEntry) ([]byte, error) {
 		return nil, err
 	}
 	for _, ent := range d {
-		enc.PutUint16(buf[0:2], uint16(ent.tag))
-		enc.PutUint16(buf[2:4], uint16(ent.datatype))
-		count := uint32(len(ent.data))
-		if ent.datatype == dtRational {
-			count /= 2
-		}
-		enc.PutUint32(buf[4:8], count)
-		datalen := int(count * lengths[ent.datatype])
-		if datalen <= 4 {
-			ent.putData(buf[8:12])
-		} else {
-			if (o + datalen) > len(parea) {
-				newlen := len(parea) + 1024
-				for (o + datalen) > newlen {
-					newlen += 1024
-				}
-				newarea := make([]byte, newlen)
-				copy(newarea, parea)
-				parea = newarea
-			}
-			ent.putData(parea[o : o+datalen])
-			enc.PutUint32(buf[8:12], uint32(pstart+o))
-			o += datalen
+		buf, err := marshalIFDEntry(ent, pstart, &parea)
+		if err != nil {
+			return nil, err
 		}
 		if _, err := out.Write(buf[:]); err != nil {
 			return nil, err
@@ -304,7 +365,7 @@ func marshalIFD(ifdOffset, nextIFDOffset uint32, d []ifdEntry) ([]byte, error) {
 	if err := binary.Write(&out, enc, nextIFDOffset); err != nil {
 		return nil, err
 	}
-	_, err := out.Write(parea[:o])
+	_, err := out.Write(parea)
 	return out.Bytes(), err
 }
 
@@ -332,13 +393,109 @@ func compressionOptions(opt *Options) (uint32, bool) {
 	predictor := false
 	if opt != nil {
 		compression = opt.Compression.specValue()
-		// The TIFF 6.0 spec (June,1992) says the predictor field is only to be used with LZW. (See page 64).
+		// The TIFF 6.0 spec (June, 1992) says the predictor field is only to be used with LZW. (See page 64).
 		// Yet this TIFF writer also allows prediction for Deflate compression.
-		// This makes sense as Deflate is supposedly the successor to LWZ.
+		// This makes sense as Deflate is supposedly the successor to LZW.
 		// Also both PNG and PDF use Deflate with predictors.
-		predictor = opt.Predictor && compression == cLZW || compression == cDeflate
+		predictor = opt.Predictor && (compression == cLZW || compression == cDeflate)
 	}
 	return compression, predictor
+}
+
+func imageDimensions(m image.Image, compression uint32) (image.Point, error) {
+	if m == nil || isNilStandardImage(m) {
+		return image.Point{}, errors.New("tiff: nil image")
+	}
+	b := m.Bounds()
+	if b.Max.X < b.Min.X || b.Max.Y < b.Min.Y {
+		return image.Point{}, errors.New("tiff: invalid image bounds")
+	}
+	dx := uint64(uint(b.Max.X) - uint(b.Min.X))
+	dy := uint64(uint(b.Max.Y) - uint(b.Min.Y))
+	if dx > math.MaxUint32 || dy > math.MaxUint32 || dx > uint64(maxInt()) || dy > uint64(maxInt()) {
+		return image.Point{}, errors.New("tiff: image dimensions too large")
+	}
+	d := image.Pt(int(dx), int(dy))
+	size, ok := checkedMul3(d.X, d.Y, imageBytesPerPixel(m))
+	if !ok || compression == cNone && uint64(size) > math.MaxUint32 {
+		return image.Point{}, errors.New("tiff: image data too large")
+	}
+	if err := validateImagePix(m, d); err != nil {
+		return image.Point{}, err
+	}
+	return d, nil
+}
+
+func isNilStandardImage(m image.Image) bool {
+	switch m := m.(type) {
+	case *image.Paletted:
+		return m == nil
+	case *image.Gray:
+		return m == nil
+	case *image.Gray16:
+		return m == nil
+	case *image.NRGBA:
+		return m == nil
+	case *image.NRGBA64:
+		return m == nil
+	case *image.RGBA:
+		return m == nil
+	case *image.RGBA64:
+		return m == nil
+	case *image.CMYK:
+		return m == nil
+	}
+	return false
+}
+
+func imageBytesPerPixel(m image.Image) int {
+	switch m.(type) {
+	case *image.Paletted, *image.Gray:
+		return 1
+	case *image.Gray16:
+		return 2
+	case *image.NRGBA64, *image.RGBA64:
+		return 8
+	default:
+		return 4
+	}
+}
+
+func validateImagePix(m image.Image, d image.Point) error {
+	switch m := m.(type) {
+	case *image.Paletted:
+		return validatePix(m.Pix, m.Stride, d.X, d.Y, 1)
+	case *image.Gray:
+		return validatePix(m.Pix, m.Stride, d.X, d.Y, 1)
+	case *image.Gray16:
+		return validatePix(m.Pix, m.Stride, d.X, d.Y, 2)
+	case *image.NRGBA:
+		return validatePix(m.Pix, m.Stride, d.X, d.Y, 4)
+	case *image.NRGBA64:
+		return validatePix(m.Pix, m.Stride, d.X, d.Y, 8)
+	case *image.RGBA:
+		return validatePix(m.Pix, m.Stride, d.X, d.Y, 4)
+	case *image.RGBA64:
+		return validatePix(m.Pix, m.Stride, d.X, d.Y, 8)
+	case *image.CMYK:
+		return validatePix(m.Pix, m.Stride, d.X, d.Y, 4)
+	}
+	return nil
+}
+
+func validatePix(pix []byte, stride, width, height, bytesPerPixel int) error {
+	if width == 0 || height == 0 {
+		return nil
+	}
+	rowLen, ok := checkedMul3(width, bytesPerPixel, 1)
+	if !ok || rowLen > int64(maxInt()) || stride < int(rowLen) {
+		return errors.New("tiff: invalid image stride")
+	}
+	lastRow, ok := checkedMul3(height-1, stride, 1)
+	if !ok || lastRow > int64(maxInt())-rowLen || int(lastRow+rowLen) > len(pix) {
+		return errors.New("tiff: invalid image pixel buffer")
+	}
+	return nil
 }
 
 func imageWriter(compression uint32, buf *bytes.Buffer) (io.Writer, io.Closer, error) {
@@ -412,8 +569,11 @@ func encodeImage(w io.Writer, m image.Image, d image.Point, predictor bool) (uin
 }
 
 func encodePage(m image.Image, opt *Options) (encodedImage, error) {
-	d := m.Bounds().Size()
 	compression, predictor := compressionOptions(opt)
+	d, err := imageDimensions(m, compression)
+	if err != nil {
+		return encodedImage{}, err
+	}
 	var buf bytes.Buffer
 	dst, closer, err := imageWriter(compression, &buf)
 	if err != nil {
@@ -424,7 +584,8 @@ func encodePage(m image.Image, opt *Options) (encodedImage, error) {
 	if predictor {
 		pr = prHorizontal
 	}
-	photometricInterpretation, samplesPerPixel, bitsPerSample, extraSamples, colorMap, err := encodeImage(dst, m, d, predictor)
+	photometricInterpretation, samplesPerPixel, bitsPerSample, extraSamples, colorMap, err :=
+		encodeImage(dst, m, d, predictor)
 	if err != nil {
 		return encodedImage{}, err
 	}
@@ -433,17 +594,20 @@ func encodePage(m image.Image, opt *Options) (encodedImage, error) {
 			return encodedImage{}, err
 		}
 	}
+	if uint64(buf.Len()) > math.MaxUint32 {
+		return encodedImage{}, errors.New("tiff: encoded image data too large")
+	}
 
 	imageLen := buf.Len()
 	ifd := []ifdEntry{
-		{tImageWidth, dtShort, []uint32{uint32(d.X)}},
-		{tImageLength, dtShort, []uint32{uint32(d.Y)}},
+		integerIFDEntry(tImageWidth, uint32(d.X)),
+		integerIFDEntry(tImageLength, uint32(d.Y)),
 		{tBitsPerSample, dtShort, bitsPerSample},
 		{tCompression, dtShort, []uint32{compression}},
 		{tPhotometricInterpretation, dtShort, []uint32{photometricInterpretation}},
 		{tStripOffsets, dtLong, []uint32{0}},
 		{tSamplesPerPixel, dtShort, []uint32{samplesPerPixel}},
-		{tRowsPerStrip, dtShort, []uint32{uint32(d.Y)}},
+		integerIFDEntry(tRowsPerStrip, uint32(d.Y)),
 		{tStripByteCounts, dtLong, []uint32{uint32(imageLen)}},
 		// There is currently no support for storing the image
 		// resolution, so give a bogus value of 72x72 dpi.
@@ -462,6 +626,14 @@ func encodePage(m image.Image, opt *Options) (encodedImage, error) {
 	}
 
 	return encodedImage{data: buf.Bytes(), ifd: ifd}, nil
+}
+
+func integerIFDEntry(tag int, value uint32) ifdEntry {
+	datatype := dtLong
+	if value <= math.MaxUint16 {
+		datatype = dtShort
+	}
+	return ifdEntry{tag, datatype, []uint32{value}}
 }
 
 func setStripOffset(ifd []ifdEntry, stripOffset uint32) []ifdEntry {
@@ -504,18 +676,24 @@ func EncodeAll(w io.Writer, m []image.Image, opt *Options) error {
 }
 
 func writePages(w io.Writer, pages []encodedImage) error {
+	if w == nil {
+		return errors.New("tiff: nil writer")
+	}
+	if len(pages) == 0 {
+		return errors.New("tiff: no pages to write")
+	}
 	dataOffsets, ifdOffsets, err := pageOffsets(pages)
 	if err != nil {
 		return err
 	}
-	if _, err = io.WriteString(w, leHeader); err != nil {
-		return err
-	}
-	if err = binary.Write(w, enc, uint32(ifdOffsets[0])); err != nil {
+	var header [8]byte
+	copy(header[:4], leHeader)
+	enc.PutUint32(header[4:], ifdOffsets[0])
+	if err = writeBytes(w, header[:]); err != nil {
 		return err
 	}
 	for _, page := range pages {
-		if _, err = w.Write(page.data); err != nil {
+		if err = writeBytes(w, page.data); err != nil {
 			return err
 		}
 	}
@@ -557,7 +735,7 @@ func writePageIFDs(w io.Writer, pages []encodedImage, dataOffsets, ifdOffsets []
 		if err != nil {
 			return err
 		}
-		if _, err = w.Write(ifd); err != nil {
+		if err = writeBytes(w, ifd); err != nil {
 			return err
 		}
 	}
