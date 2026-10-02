@@ -11,7 +11,7 @@ import (
 	"errors"
 	"image"
 	"image/color"
-
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -643,6 +643,79 @@ func TestRejectHugeDimensions(t *testing.T) {
 
 	if _, err := DecodeConfig(bytes.NewReader(b)); err == nil {
 		t.Fatal("DecodeConfig with huge dimensions: got nil error, want non-nil")
+	}
+}
+
+type headerOnlyReaderAt struct{}
+
+func (headerOnlyReaderAt) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (headerOnlyReaderAt) ReadAt(p []byte, offset int64) (int, error) {
+	if offset != 0 {
+		panic("invalid offset reached ReaderAt")
+	}
+	var header [8]byte
+	copy(header[:], leHeader)
+	enc.PutUint32(header[4:], 8)
+	return copy(p, header[:]), nil
+}
+
+func TestDecodeConfigAtRejectsInvalidOffsets(t *testing.T) {
+	maxInt64 := int64(^uint64(0) >> 1)
+	for _, offset := range []int64{-1, maxInt64 - 1, maxInt64} {
+		if _, err := DecodeConfigAt(headerOnlyReaderAt{}, offset); err == nil {
+			t.Fatalf("DecodeConfigAt offset %d: got nil error, want non-nil", offset)
+		}
+	}
+}
+
+type trackedReaderAt struct {
+	io.ReaderAt
+	maxRead int
+}
+
+func (r *trackedReaderAt) ReadAt(p []byte, offset int64) (int, error) {
+	if len(p) > r.maxRead {
+		r.maxRead = len(p)
+	}
+	return r.ReaderAt.ReadAt(p, offset)
+}
+
+func TestIFDValuesUseBoundedCache(t *testing.T) {
+	const count = 20_000
+	data := make([]byte, 4*count)
+	for i := 0; i < count; i++ {
+		enc.PutUint32(data[4*i:], uint32(i+1))
+	}
+	r := &trackedReaderAt{ReaderAt: bytes.NewReader(data)}
+	var entry [ifdLen]byte
+	enc.PutUint16(entry[2:4], dtLong)
+	enc.PutUint32(entry[4:8], count)
+	d := decoder{r: r, byteOrder: enc, ifd: map[int][ifdLen]byte{tStripOffsets: entry}}
+
+	values, err := d.parseIFDOffsets(tStripOffsets, count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.maxRead != 1 {
+		t.Fatalf("IFD range validation read %d bytes, want 1", r.maxRead)
+	}
+	for _, index := range []int{0, ifdValueCacheSize/4 - 1, ifdValueCacheSize / 4, count - 1} {
+		got, err := values.value(index)
+		if err != nil {
+			t.Fatalf("IFD value %d: %v", index, err)
+		}
+		if want := uint32(index + 1); got != want {
+			t.Fatalf("IFD value %d = %d, want %d", index, got, want)
+		}
+	}
+	if r.maxRead > ifdValueCacheSize || len(values.cache) > ifdValueCacheSize {
+		t.Fatalf("IFD cache or read exceeded %d bytes: cache=%d read=%d", ifdValueCacheSize, len(values.cache), r.maxRead)
+	}
+	if _, err := values.value(count); err == nil {
+		t.Fatal("IFD value access accepted an out-of-range index")
 	}
 }
 

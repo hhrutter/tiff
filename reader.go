@@ -46,7 +46,7 @@ const maxChunkSize = 10 << 20 // 10M
 // safeReadAt reads n bytes without preallocating very large slices before the
 // reader has proven that the data exists.
 func safeReadAt(r io.ReaderAt, n uint64, off int64) ([]byte, error) {
-	if int64(n) < 0 || n != uint64(int(n)) {
+	if off < 0 || n > uint64(maxInt()) || n > uint64(math.MaxInt64-off) {
 		return nil, io.ErrUnexpectedEOF
 	}
 
@@ -193,13 +193,119 @@ func (d *decoder) ifdUint(p []byte, maxCount int) (u []uint, err error) {
 	return u, nil
 }
 
-// parseIFDOffsets parses an IFD entry stored in d.ifd using ifdUint.
-func (d *decoder) parseIFDOffsets(tag int, maxCount int) ([]uint, error) {
+const ifdValueCacheSize = 32 << 10
+
+type ifdValues struct {
+	r         io.ReaderAt
+	byteOrder binary.ByteOrder
+	datatype  uint16
+	count     int
+	offset    int64
+	inline    [4]byte
+	isInline  bool
+	cache     []byte
+	cacheAt   int
+}
+
+func (v ifdValues) valueSize() int {
+	return int(lengths[v.datatype])
+}
+
+func (v ifdValues) validate() error {
+	if v.isInline || v.count == 0 {
+		return nil
+	}
+	last := v.offset + int64(v.count*v.valueSize()) - 1
+	var b [1]byte
+	n, err := v.r.ReadAt(b[:], last)
+	if err != nil {
+		return err
+	}
+	if n != len(b) {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+func (v *ifdValues) bytesAt(index int) ([]byte, error) {
+	size := v.valueSize()
+	at := index * size
+	if v.isInline {
+		return v.inline[at : at+size], nil
+	}
+	if at < v.cacheAt || at+size > v.cacheAt+len(v.cache) {
+		n := minInt(ifdValueCacheSize, v.count*size-at)
+		if cap(v.cache) < n {
+			v.cache = make([]byte, n)
+		} else {
+			v.cache = v.cache[:n]
+		}
+		read, err := v.r.ReadAt(v.cache, v.offset+int64(at))
+		if err != nil {
+			return nil, err
+		}
+		if read != len(v.cache) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		v.cacheAt = at
+	}
+	start := at - v.cacheAt
+	return v.cache[start : start+size], nil
+}
+
+func (v *ifdValues) value(index int) (uint32, error) {
+	if index < 0 || index >= v.count {
+		return 0, FormatError("IFD value index out of range")
+	}
+	b, err := v.bytesAt(index)
+	if err != nil {
+		return 0, err
+	}
+	switch v.datatype {
+	case dtByte:
+		return uint32(b[0]), nil
+	case dtShort:
+		return uint32(v.byteOrder.Uint16(b)), nil
+	case dtLong:
+		return v.byteOrder.Uint32(b), nil
+	}
+	return 0, UnsupportedError("data type")
+}
+
+func (d *decoder) newIFDValues(p []byte, maxCount int) (ifdValues, error) {
+	var v ifdValues
+	if len(p) < ifdLen || maxCount < 0 {
+		return v, FormatError("bad IFD entry")
+	}
+	v.r, v.byteOrder = d.r, d.byteOrder
+	v.datatype = d.byteOrder.Uint16(p[2:4])
+	if dt := int(v.datatype); dt <= 0 || dt >= len(lengths) {
+		return v, UnsupportedError("IFD entry datatype")
+	}
+	if v.datatype != dtByte && v.datatype != dtShort && v.datatype != dtLong {
+		return v, UnsupportedError("data type")
+	}
+	count := d.byteOrder.Uint32(p[4:8])
+	if count > math.MaxInt32/lengths[v.datatype] {
+		return v, FormatError("IFD data too large")
+	}
+	v.count = minInt(int(count), maxCount)
+	if lengths[v.datatype]*count <= 4 {
+		copy(v.inline[:], p[8:12])
+		v.isInline = true
+	} else {
+		v.offset = int64(d.byteOrder.Uint32(p[8:12]))
+	}
+	return v, v.validate()
+}
+
+// parseIFDOffsets prepares bounded access to an offset or byte-count IFD entry.
+func (d *decoder) parseIFDOffsets(tag int, maxCount int) (ifdValues, error) {
 	p, ok := d.ifd[tag]
 	if !ok {
-		return nil, nil
+		return ifdValues{}, nil
 	}
-	return d.ifdUint(p[:], maxCount)
+	return d.newIFDValues(p[:], maxCount)
 }
 
 // parseIFD decides whether the the IFD entry in p is "interesting" and
@@ -789,7 +895,7 @@ func (d *decoder) decodeJPGOld(img image.Image, offset, n, lim int64, x, y, widt
 type blockLayout struct {
 	width, height, across, down int
 	padding                     bool
-	offsets, counts             []uint
+	offsets, counts             ifdValues
 }
 
 type tiffBlock struct {
@@ -867,7 +973,7 @@ func (d *decoder) readBlockLayout() (blockLayout, error) {
 		return l, err
 	}
 	// Check if we have the right number of strips/tiles, offsets and counts.
-	if n := l.across * l.down; len(l.offsets) < n || len(l.counts) < n {
+	if n := l.across * l.down; l.offsets.count < n || l.counts.count < n {
 		return l, FormatError("inconsistent header")
 	}
 	return l, nil
@@ -1021,19 +1127,27 @@ func (d *decoder) decodeBlock(img image.Image, b tiffBlock, limit int64) error {
 }
 
 func (d *decoder) decodeBlocks(img image.Image, l blockLayout, limit int64) error {
-	for i := 0; i < l.across; i++ {
-		width := l.width
-		if !l.padding && i == l.across-1 && d.config.Width%l.width != 0 {
-			width = d.config.Width % l.width
+	for j := 0; j < l.down; j++ {
+		height := l.height
+		if !l.padding && j == l.down-1 && d.config.Height%l.height != 0 {
+			height = d.config.Height % l.height
 		}
-		for j := 0; j < l.down; j++ {
-			height := l.height
-			if !l.padding && j == l.down-1 && d.config.Height%l.height != 0 {
-				height = d.config.Height % l.height
+		for i := 0; i < l.across; i++ {
+			width := l.width
+			if !l.padding && i == l.across-1 && d.config.Width%l.width != 0 {
+				width = d.config.Width % l.width
 			}
 			index := j*l.across + i
+			offset, err := l.offsets.value(index)
+			if err != nil {
+				return err
+			}
+			n, err := l.counts.value(index)
+			if err != nil {
+				return err
+			}
 			b := tiffBlock{
-				offset: int64(l.offsets[index]), n: int64(l.counts[index]),
+				offset: int64(offset), n: int64(n),
 				x: i * l.width, y: j * l.height, width: width, height: height,
 			}
 			if err := d.decodeBlock(img, b, limit); err != nil {

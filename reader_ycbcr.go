@@ -210,8 +210,8 @@ type ycbcrLayout struct {
 	width, height int
 	across, down  int
 	tiled         bool
-	offsets       []uint
-	counts        []uint
+	offsets       ifdValues
+	counts        ifdValues
 }
 
 func (d *decoder) ycbcrInteger(tag int, required bool) error {
@@ -255,14 +255,14 @@ func (d *decoder) checkYCbCrDimensions() error {
 	return nil
 }
 
-func (d *decoder) ycbcrOffsets(tag, count int) ([]uint, error) {
+func (d *decoder) ycbcrOffsets(tag, count int) (ifdValues, error) {
 	p, found := d.ifd[tag]
 	if !found {
-		return nil, FormatError(fmt.Sprintf("missing YCbCr tag %d", tag))
+		return ifdValues{}, FormatError(fmt.Sprintf("missing YCbCr tag %d", tag))
 	}
 	typ := d.byteOrder.Uint16(p[2:4])
 	if (typ != dtShort && typ != dtLong) || uint64(d.byteOrder.Uint32(p[4:8])) != uint64(count) {
-		return nil, FormatError(fmt.Sprintf("invalid YCbCr tag %d type or count", tag))
+		return ifdValues{}, FormatError(fmt.Sprintf("invalid YCbCr tag %d type or count", tag))
 	}
 	return d.parseIFDOffsets(tag, count)
 }
@@ -340,22 +340,29 @@ func (d *decoder) decodeYCbCr() (image.Image, error) {
 		return nil, err
 	}
 	img := image.NewRGBA(image.Rect(0, 0, d.config.Width, d.config.Height))
-	for i := range l.offsets {
-		if err := d.decodeYCbCrSegment(img, l, i, tables); err != nil {
+	for i := 0; i < l.offsets.count; i++ {
+		if err := d.decodeYCbCrSegment(img, &l, i, tables); err != nil {
 			return nil, err
 		}
 	}
 	return img, nil
 }
 
-func (d *decoder) decodeYCbCrSegment(img *image.RGBA, l ycbcrLayout, index int, tables []byte) error {
+func (d *decoder) decodeYCbCrSegment(img *image.RGBA, l *ycbcrLayout, index int, tables []byte) error {
 	x, y := (index%l.across)*l.width, (index/l.across)*l.height
 	height := l.height
 	if !l.tiled && height > d.config.Height-y {
 		height = d.config.Height - y
 	}
-	n := int64(l.counts[index])
-	r, err := d.ycbcrJPEGReader(int64(l.offsets[index]), n, l.width, height, tables)
+	offset, err := l.offsets.value(index)
+	if err != nil {
+		return err
+	}
+	n, err := l.counts.value(index)
+	if err != nil {
+		return err
+	}
+	r, err := d.ycbcrJPEGReader(int64(offset), int64(n), l.width, height, tables)
 	if err != nil {
 		return err
 	}

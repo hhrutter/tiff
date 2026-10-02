@@ -30,11 +30,12 @@ func (d *decoder) readImageIFD(offset int64) error {
 	if offset == 0 {
 		offset = int64(d.byteOrder.Uint32(p[4:]))
 	}
-	if _, err := d.r.ReadAt(p[:2], offset); err != nil {
+	count, err := safeReadAt(d.r, 2, offset)
+	if err != nil {
 		return err
 	}
 	// The first two bytes contain the number of entries (12 bytes each).
-	numItems := int(d.byteOrder.Uint16(p[:2]))
+	numItems := int(d.byteOrder.Uint16(count))
 	// All IFD entries are read in one chunk.
 	entries, err := safeReadAt(d.r, uint64(ifdLen*numItems), offset+2)
 	if err != nil {
