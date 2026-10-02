@@ -91,8 +91,8 @@ func (d *decoder) initYCbCr() error {
 	if err := d.ycbcrRationals(tYCbCrCoefficients, false, []uint32{299, 587, 114}, 1000); err != nil {
 		return err
 	}
-	// See TIFF 6.0, section 21: ReferenceBlackWhite must be explicit for Class Y.
-	if err := d.ycbcrRationals(tReferenceBlackWhite, true, []uint32{0, 255, 128, 255, 128, 255}, 1); err != nil {
+	// Some older encoders omit ReferenceBlackWhite. Use the full-range default in that case.
+	if err := d.ycbcrRationals(tReferenceBlackWhite, false, []uint32{0, 255, 128, 255, 128, 255}, 1); err != nil {
 		return err
 	}
 	if p, found := d.ifd[tJPEGTables]; found {

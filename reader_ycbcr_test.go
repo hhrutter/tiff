@@ -282,18 +282,30 @@ func TestYCbCrJPEGSubsampling(t *testing.T) {
 
 // TestYCbCrJPEGDefaults checks permitted omissions and equivalent rational representations.
 func TestYCbCrJPEGDefaults(t *testing.T) {
-	s := jpegTestSpec{w: 16, h: 16, bw: 16, bh: 16}
-	s.edit = func(f map[int]jpegTestField) {
-		delete(f, tPlanarConfiguration)
-		delete(f, tYCbCrSubSampling)
-		delete(f, tYCbCrPositioning)
-		delete(f, tRowsPerStrip)
-		f[tYCbCrCoefficients] = jpegTestRational(binary.LittleEndian, 598, 2000, 1174, 2000, 228, 2000)
-		f[tReferenceBlackWhite] = jpegTestRational(binary.LittleEndian, 0, 2, 510, 2, 256, 2, 510, 2, 256, 2, 510, 2)
+	tests := []struct {
+		name string
+		edit func(map[int]jpegTestField)
+	}{
+		{"omitted", func(f map[int]jpegTestField) {
+			delete(f, tPlanarConfiguration)
+			delete(f, tYCbCrSubSampling)
+			delete(f, tYCbCrPositioning)
+			delete(f, tReferenceBlackWhite)
+			delete(f, tRowsPerStrip)
+		}},
+		{"equivalent_rationals", func(f map[int]jpegTestField) {
+			f[tYCbCrCoefficients] = jpegTestRational(binary.LittleEndian, 598, 2000, 1174, 2000, 228, 2000)
+			f[tReferenceBlackWhite] = jpegTestRational(binary.LittleEndian, 0, 2, 510, 2, 256, 2, 510, 2, 256, 2, 510, 2)
+		}},
 	}
-	b, want := jpegTestTIFF(t, s)
-	got, err := Decode(bytes.NewReader(b))
-	checkJPEGTestImage(t, got, err, want)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := jpegTestSpec{w: 16, h: 16, bw: 16, bh: 16, edit: tc.edit}
+			b, want := jpegTestTIFF(t, s)
+			got, err := Decode(bytes.NewReader(b))
+			checkJPEGTestImage(t, got, err, want)
+		})
+	}
 }
 
 // TestYCbCrJPEGPages checks both explicit IFD entry points against a second image in the same file.
@@ -386,7 +398,7 @@ func TestYCbCrJPEGMetadata(t *testing.T) {
 			checkYCbCrError(t, b, tc.unsupported)
 		})
 	}
-	for _, tag := range []int{tImageWidth, tImageLength, tCompression, tSamplesPerPixel, tBitsPerSample, tReferenceBlackWhite} {
+	for _, tag := range []int{tImageWidth, tImageLength, tCompression, tSamplesPerPixel, tBitsPerSample} {
 		t.Run(fmt.Sprintf("missing_%d", tag), func(t *testing.T) {
 			s := jpegTestSpec{w: 16, h: 16, bw: 16, bh: 16}
 			s.edit = func(f map[int]jpegTestField) { delete(f, tag) }
