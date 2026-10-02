@@ -21,14 +21,21 @@ type byteReader interface {
 // The PackBits compression format is described in section 9 (p. 42)
 // of the TIFF spec.
 func unpackBits(r io.Reader, lim int64) ([]byte, error) {
+	if lim < 0 {
+		return nil, errors.New("tiff: invalid PackBits data limit")
+	}
 	buf := make([]byte, 128)
-	dst := make([]byte, 0, 1024)
+	capacity := min(lim, int64(1024))
+	dst := make([]byte, 0, int(capacity))
 	br, ok := r.(byteReader)
 	if !ok {
 		br = bufio.NewReader(r)
 	}
 
 	for {
+		if int64(len(dst)) == lim {
+			return dst, nil
+		}
 		b, err := br.ReadByte()
 		if err != nil {
 			if err == io.EOF {
@@ -43,8 +50,10 @@ func unpackBits(r io.Reader, lim int64) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			if int64(len(dst)+n) > lim {
-				return nil, errors.New("tiff: PackBits data too large")
+			remaining := int(lim - int64(len(dst)))
+			if n > remaining {
+				dst = append(dst, buf[:remaining]...)
+				return dst, nil
 			}
 			dst = append(dst, buf[:n]...)
 		case code == -128:
@@ -53,13 +62,15 @@ func unpackBits(r io.Reader, lim int64) ([]byte, error) {
 			if b, err = br.ReadByte(); err != nil {
 				return nil, err
 			}
-			if int64(len(dst)+1-code) > lim {
-				return nil, errors.New("tiff: PackBits data too large")
+			n := 1 - code
+			remaining := int(lim - int64(len(dst)))
+			if n > remaining {
+				n = remaining
 			}
-			for j := 0; j < 1-code; j++ {
+			for j := 0; j < n; j++ {
 				buf[j] = b
 			}
-			dst = append(dst, buf[:1-code]...)
+			dst = append(dst, buf[:n]...)
 		}
 	}
 }

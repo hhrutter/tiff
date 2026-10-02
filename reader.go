@@ -1006,14 +1006,12 @@ func (d *decoder) newImage() image.Image {
 }
 
 func (d *decoder) loadUncompressedBlock(b tiffBlock, limit int64) error {
-	if b.n > limit {
-		return FormatError("block data size too large")
-	}
+	n := min(b.n, limit)
 	var err error
 	if r, ok := d.r.(*buffer); ok {
-		d.buf, err = r.Slice(int(b.offset), int(b.n))
+		d.buf, err = r.Slice(int(b.offset), int(n))
 	} else {
-		d.buf, err = safeReadAt(d.r, uint64(b.n), b.offset)
+		d.buf, err = safeReadAt(d.r, uint64(n), b.offset)
 	}
 	return err
 }
@@ -1052,12 +1050,14 @@ func (d *decoder) loadFaxBlock(b tiffBlock, limit int64, compression uint) error
 func (d *decoder) loadLZWBlock(b tiffBlock, limit int64) error {
 	r := lzw.NewReader(io.NewSectionReader(d.r, b.offset, b.n))
 	var err error
-	d.buf, err = readBuf(r, d.buf, d.lzwBlockDataSize(b, limit))
-	r.Close()
+	d.buf, err = readBuf(r, d.buf, limit)
+	if closeErr := r.Close(); err == nil {
+		err = closeErr
+	}
 	return err
 }
 
-func (d *decoder) lzwBlockDataSize(b tiffBlock, limit int64) int64 {
+func (d *decoder) blockDataSize(b tiffBlock, limit int64) int64 {
 	rowBits, ok := checkedMul3(b.width, len(d.features[tBitsPerSample]), int(d.bpp))
 	if !ok || rowBits <= 0 || rowBits > int64(maxInt()-7) {
 		return limit
@@ -1075,7 +1075,15 @@ func (d *decoder) loadDeflateBlock(b tiffBlock, limit int64) error {
 		return err
 	}
 	d.buf, err = readBuf(r, d.buf, limit)
-	r.Close()
+	if err == nil && int64(len(d.buf)) == limit {
+		var extra [1]byte
+		if n, tailErr := r.Read(extra[:]); n == 0 && tailErr != io.EOF {
+			err = tailErr
+		}
+	}
+	if closeErr := r.Close(); err == nil {
+		err = closeErr
+	}
 	return err
 }
 
@@ -1120,7 +1128,7 @@ func (d *decoder) decodeBlock(img image.Image, b tiffBlock, limit int64) error {
 	if compression == cJPEGOld || compression == cJPEG {
 		return d.decodeCompressedJPEG(img, b, limit, compression)
 	}
-	if err := d.loadBlockData(b, limit, compression); err != nil {
+	if err := d.loadBlockData(b, d.blockDataSize(b, limit), compression); err != nil {
 		return err
 	}
 	return d.decode(img, b.x, b.y, b.x+b.width, b.y+b.height)

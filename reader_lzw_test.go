@@ -178,7 +178,7 @@ func TestDecodeLZWTableFullStrip(t *testing.T) {
 	assertLZWGrayImage(t, data, width, height, want)
 }
 
-func TestLZWBlockDataSize(t *testing.T) {
+func TestBlockDataSize(t *testing.T) {
 	tests := []struct {
 		name        string
 		width       int
@@ -195,8 +195,8 @@ func TestLZWBlockDataSize(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			d := decoder{bpp: tt.bits[0], features: map[int][]uint{tBitsPerSample: tt.bits}}
 			b := tiffBlock{width: tt.width, height: tt.height}
-			if got := d.lzwBlockDataSize(b, tt.limit); got != tt.want {
-				t.Errorf("lzwBlockDataSize = %d, want %d", got, tt.want)
+			if got := d.blockDataSize(b, tt.limit); got != tt.want {
+				t.Errorf("blockDataSize = %d, want %d", got, tt.want)
 			}
 		})
 	}
