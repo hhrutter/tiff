@@ -335,7 +335,7 @@ func (d *decoder) decodeYCbCr() (image.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	tables, err := d.ycbcrJPEGTables()
+	tables, err := d.jpegTables()
 	if err != nil {
 		return nil, err
 	}

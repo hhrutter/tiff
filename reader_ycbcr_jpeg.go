@@ -1,3 +1,4 @@
+// Copyright 2026 The tiff Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -66,7 +67,7 @@ func jpegIgnoredMarker(marker byte) bool {
 	return (marker >= 0xe0 && marker <= 0xef) || marker == 0xfe
 }
 
-func (d *decoder) ycbcrJPEGTables() ([]byte, error) {
+func (d *decoder) jpegTables() ([]byte, error) {
 	p, found := d.ifd[tJPEGTables]
 	if !found {
 		return nil, nil
@@ -75,23 +76,84 @@ func (d *decoder) ycbcrJPEGTables() ([]byte, error) {
 	if d.byteOrder.Uint16(p[2:4]) != 7 || n < 4 {
 		return nil, FormatError("invalid JPEGTables type or count")
 	}
-	bb := p[8:12]
+	var r io.Reader = bytes.NewReader(p[8:12])
 	if n > 4 {
-		var err error
-		bb, err = safeReadAt(d.r, uint64(n), int64(d.byteOrder.Uint32(p[8:12])))
-		if err != nil {
-			return nil, err
-		}
+		r = io.NewSectionReader(d.r, int64(d.byteOrder.Uint32(p[8:12])), int64(n))
 	}
-	r := bytes.NewReader(bb)
 	if err := readJPEGStart(r); err != nil {
 		return nil, err
 	}
 	return readJPEGTables(r)
 }
 
-func readJPEGTables(r *bytes.Reader) ([]byte, error) {
-	var tables []byte
+type jpegTableSet struct {
+	quant   [4][]byte
+	huffman [2][4][]byte
+}
+
+func (s *jpegTableSet) add(marker byte, p []byte) error {
+	switch marker {
+	case 0xdb:
+		return s.addQuantization(p)
+	case 0xc4:
+		return s.addHuffman(p)
+	}
+	return UnsupportedError(fmt.Sprintf("JPEG table marker 0x%02x", marker))
+}
+
+func (s *jpegTableSet) addQuantization(p []byte) error {
+	for len(p) > 0 {
+		precision, index := p[0]>>4, p[0]&15
+		if precision > 1 || index >= byte(len(s.quant)) {
+			return FormatError("invalid JPEG quantization table")
+		}
+		n := 65 + 64*int(precision)
+		if len(p) < n {
+			return FormatError("invalid JPEG quantization table length")
+		}
+		s.quant[index] = appendJPEGMarker(nil, 0xdb, p[:n])
+		p = p[n:]
+	}
+	return nil
+}
+
+func (s *jpegTableSet) addHuffman(p []byte) error {
+	for len(p) > 0 {
+		if len(p) < 17 {
+			return FormatError("invalid JPEG Huffman table length")
+		}
+		class, index := p[0]>>4, p[0]&15
+		if class >= byte(len(s.huffman)) || index >= byte(len(s.huffman[0])) {
+			return FormatError("invalid JPEG Huffman table")
+		}
+		n := 17
+		for _, count := range p[1:17] {
+			n += int(count)
+		}
+		if n > len(p) || n > 17+256 {
+			return FormatError("invalid JPEG Huffman table length")
+		}
+		s.huffman[class][index] = appendJPEGMarker(nil, 0xc4, p[:n])
+		p = p[n:]
+	}
+	return nil
+}
+
+func (s *jpegTableSet) bytes() []byte {
+	var b []byte
+	for _, table := range s.quant {
+		b = append(b, table...)
+	}
+	for _, class := range s.huffman {
+		for _, table := range class {
+			b = append(b, table...)
+		}
+	}
+	return b
+}
+
+func readJPEGTables(r io.Reader) ([]byte, error) {
+	var tables jpegTableSet
 	for {
 		marker, p, err := readJPEGMarker(r)
 		if err != nil {
@@ -99,12 +161,15 @@ func readJPEGTables(r *bytes.Reader) ([]byte, error) {
 		}
 		switch {
 		case marker == 0xd9:
-			if r.Len() != 0 {
+			var b [1]byte
+			if n, err := r.Read(b[:]); n != 0 || err != io.EOF {
 				return nil, FormatError("data after JPEGTables EOI")
 			}
-			return tables, nil
+			return tables.bytes(), nil
 		case marker == 0xdb || marker == 0xc4:
-			tables = appendJPEGMarker(tables, marker, p)
+			if err := tables.add(marker, p); err != nil {
+				return nil, err
+			}
 		case jpegIgnoredMarker(marker), marker == 0xdd:
 			// DRI state is reset by the image segment's SOI; see TIFF Technical Note #2.
 		default:
@@ -114,9 +179,10 @@ func readJPEGTables(r *bytes.Reader) ([]byte, error) {
 }
 
 type ycbcrJPEGHeader struct {
-	prefix []byte
-	ids    [3]byte
-	frame  bool
+	tables  jpegTableSet
+	frame   []byte
+	restart []byte
+	ids     [3]byte
 }
 
 func (d *decoder) ycbcrJPEGReader(offset, n int64, width, height int, tables []byte) (io.Reader, error) {
@@ -124,7 +190,7 @@ func (d *decoder) ycbcrJPEGReader(offset, n int64, width, height int, tables []b
 	if err := readJPEGStart(r); err != nil {
 		return nil, err
 	}
-	h := ycbcrJPEGHeader{prefix: append([]byte{0xff, 0xd8}, tables...)}
+	var h ycbcrJPEGHeader
 	for {
 		marker, p, err := readJPEGMarker(r)
 		if err != nil {
@@ -134,9 +200,13 @@ func (d *decoder) ycbcrJPEGReader(offset, n int64, width, height int, tables []b
 			if err := h.scan(p); err != nil {
 				return nil, err
 			}
-			h.prefix = appendJPEGMarker(h.prefix, marker, p)
+			prefix := append([]byte{0xff, 0xd8}, tables...)
+			prefix = append(prefix, h.tables.bytes()...)
+			prefix = append(prefix, h.frame...)
+			prefix = append(prefix, h.restart...)
+			prefix = appendJPEGMarker(prefix, marker, p)
 			scan := &ycbcrJPEGScan{r: bufio.NewReader(r)}
-			return io.MultiReader(bytes.NewReader(h.prefix), scan), nil
+			return io.MultiReader(bytes.NewReader(prefix), scan), nil
 		}
 		if err := d.ycbcrJPEGHeaderMarker(&h, marker, p, width, height); err != nil {
 			return nil, err
@@ -147,14 +217,20 @@ func (d *decoder) ycbcrJPEGReader(offset, n int64, width, height int, tables []b
 func (d *decoder) ycbcrJPEGHeaderMarker(h *ycbcrJPEGHeader, marker byte, p []byte, width, height int) error {
 	switch {
 	case marker == 0xc0 || marker == 0xc1:
-		if h.frame {
+		if h.frame != nil {
 			return FormatError("multiple JPEG frames")
 		}
 		if err := d.ycbcrJPEGFrame(h, p, width, height); err != nil {
 			return err
 		}
-		h.frame = true
-	case marker == 0xdb || marker == 0xc4 || marker == 0xdd:
+		h.frame = appendJPEGMarker(nil, marker, p)
+	case marker == 0xdb || marker == 0xc4:
+		return h.tables.add(marker, p)
+	case marker == 0xdd:
+		if len(p) != 2 {
+			return FormatError("invalid JPEG restart interval")
+		}
+		h.restart = appendJPEGMarker(nil, marker, p)
 	case jpegIgnoredMarker(marker):
 		return nil
 	case marker == 0xd8 || marker == 0xd9:
@@ -162,7 +238,6 @@ func (d *decoder) ycbcrJPEGHeaderMarker(h *ycbcrJPEGHeader, marker byte, p []byt
 	default:
 		return UnsupportedError(fmt.Sprintf("YCbCr JPEG marker 0x%02x", marker))
 	}
-	h.prefix = appendJPEGMarker(h.prefix, marker, p)
 	return nil
 }
 
@@ -206,7 +281,7 @@ func (d *decoder) checkJPEGSampling(p []byte) error {
 }
 
 func (h *ycbcrJPEGHeader) scan(p []byte) error {
-	if !h.frame {
+	if h.frame == nil {
 		return FormatError("JPEG scan before frame")
 	}
 	if len(p) != 10 || p[0] != 3 {

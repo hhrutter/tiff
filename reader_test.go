@@ -633,6 +633,27 @@ func TestRejectSmallJPEGTables(t *testing.T) {
 	}
 }
 
+func TestDecodeConfigDefersJPEGTables(t *testing.T) {
+	var b bytes.Buffer
+	b.WriteString(leHeader)
+	_ = binary.Write(&b, enc, uint32(8))
+	_ = binary.Write(&b, enc, uint16(6))
+	writeIFDEntry(&b, tImageWidth, dtShort, 1, 1)
+	writeIFDEntry(&b, tImageLength, dtShort, 1, 1)
+	writeIFDEntry(&b, tBitsPerSample, dtShort, 1, 8)
+	writeIFDEntry(&b, tCompression, dtShort, 1, cJPEG)
+	writeIFDEntry(&b, tPhotometricInterpretation, dtShort, 1, pBlackIsZero)
+	writeIFDEntry(&b, tJPEGTables, 7, 1<<30, 1<<30)
+	_ = binary.Write(&b, enc, uint32(0))
+
+	if _, err := DecodeConfig(bytes.NewReader(b.Bytes())); err != nil {
+		t.Fatalf("DecodeConfig read JPEG table payload: %v", err)
+	}
+	if _, err := Decode(bytes.NewReader(b.Bytes())); err == nil {
+		t.Fatal("Decode accepted missing JPEG table payload")
+	}
+}
+
 func TestRejectHugeDimensions(t *testing.T) {
 	b := testTIFF([]ifdEntry{
 		{tImageWidth, dtLong, []uint32{1 << 30}},

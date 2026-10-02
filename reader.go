@@ -349,7 +349,7 @@ func (d *decoder) parseIFD(p []byte) (int, error) {
 			return 0, err
 		}
 	case tJPEGTables:
-		if err := d.parseIFDJPEGTables(p); err != nil {
+		if err := validateJPEGTables(p, d.byteOrder); err != nil {
 			return 0, err
 		}
 	}
@@ -395,17 +395,24 @@ func (d *decoder) parseIFDSampleFormat(p []byte) error {
 	return nil
 }
 
-func (d *decoder) parseIFDJPEGTables(p []byte) error {
-	datatype := d.byteOrder.Uint16(p[2:4])
+func validateJPEGTables(p []byte, byteOrder binary.ByteOrder) error {
+	datatype := byteOrder.Uint16(p[2:4])
 	if dt := int(datatype); dt != 7 {
 		return UnsupportedError("IFD entry datatype")
 	}
-	size := d.byteOrder.Uint32(p[4:8])
+	size := byteOrder.Uint32(p[4:8])
 	if size < 4 {
 		return FormatError("bad JPEG tables")
 	}
+	return nil
+}
+
+func (d *decoder) loadJPEGTables() error {
+	if d.firstVal(tCompression) != cJPEG {
+		return nil
+	}
 	var err error
-	d.tables, err = safeReadAt(d.r, uint64(size-4), int64(d.byteOrder.Uint32(p[8:12]))+2)
+	d.tables, err = d.jpegTables()
 	return err
 }
 
@@ -812,37 +819,67 @@ func (d *decoder) copyStrip(dst image.Image, strip image.Image, x, y int) {
 	}
 }
 
-func (d *decoder) prepJPEG(offset, n, lim int64, needAPP14, needTables bool) (io.ReadSeeker, error) {
-	bb, err := safeReadAt(d.r, uint64(n), offset)
-	if err != nil {
+type jpegSource func() io.Reader
+
+func sectionJPEGSource(r io.ReaderAt, offset, n int64) jpegSource {
+	return func() io.Reader { return io.NewSectionReader(r, offset, n) }
+}
+
+func findJPEGSOS(r *io.SectionReader) (int64, error) {
+	if err := readJPEGStart(r); err != nil {
+		return 0, err
+	}
+	for {
+		offset, err := r.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return 0, err
+		}
+		marker, _, err := readJPEGMarker(r)
+		if err != nil {
+			return 0, err
+		}
+		if marker == 0xda {
+			return offset, nil
+		}
+		if marker == 0xd8 || marker == 0xd9 {
+			return 0, FormatError("corrupt JPG stream")
+		}
+	}
+}
+
+func (d *decoder) preparedJPEGSource(offset, n, split int64, needAPP14, needTables bool) jpegSource {
+	return func() io.Reader {
+		parts := []io.Reader{io.NewSectionReader(d.r, offset, 2)}
+		if needAPP14 {
+			parts = append(parts, bytes.NewReader(app14Marker))
+		}
+		if split > 2 {
+			parts = append(parts, io.NewSectionReader(d.r, offset+2, split-2))
+		}
+		if needTables && len(d.tables) > 0 {
+			parts = append(parts, bytes.NewReader(d.tables))
+		}
+		parts = append(parts, io.NewSectionReader(d.r, offset+split, n-split))
+		return io.MultiReader(parts...)
+	}
+}
+
+func (d *decoder) prepJPEG(offset, n, lim int64, needAPP14, needTables bool) (jpegSource, error) {
+	r := io.NewSectionReader(d.r, offset, n)
+	if err := readJPEGStart(r); err != nil {
 		return nil, err
 	}
-	if len(bb) < 2 || bb[0] != 0xFF || bb[1] != 0xD8 {
-		return nil, FormatError("corrupt JPG stream")
-	}
-
-	if needAPP14 {
-		var buf bytes.Buffer
-		buf.Write(bb[:2])
-		buf.Write(app14Marker)
-		buf.Write(bb[2:])
-		bb = buf.Bytes()
-	}
-
+	split := int64(2)
 	if needTables {
-		sosIndex := bytes.Index(bb, []byte{0xFF, 0xDA})
-		if sosIndex == -1 {
-			return nil, FormatError("corrupt JPG stream")
+		var err error
+		split, err = findJPEGSOS(io.NewSectionReader(d.r, offset, n))
+		if err != nil {
+			return nil, err
 		}
-		var buf bytes.Buffer
-		buf.Write(bb[:sosIndex])
-		buf.Write(d.tables)
-		buf.Write(bb[sosIndex:])
-		bb = buf.Bytes()
 	}
-
+	source := d.preparedJPEGSource(offset, n, split, needAPP14, needTables)
 	// JPEG headers can exceed the uncompressed block size; bound decoded dimensions instead.
-	c, err := jpeg.DecodeConfig(bytes.NewReader(bb))
+	c, err := jpeg.DecodeConfig(source())
 	if err != nil {
 		return nil, err
 	}
@@ -850,11 +887,11 @@ func (d *decoder) prepJPEG(offset, n, lim int64, needAPP14, needTables bool) (io
 	if !ok || size > lim {
 		return nil, FormatError("JPEG dimensions exceed TIFF block size")
 	}
-	return bytes.NewReader(bb), nil
+	return source, nil
 }
 
-func (d *decoder) decodeJPEGBlock(img image.Image, rd io.ReadSeeker, x, y, width, height int) error {
-	c, err := jpeg.DecodeConfig(rd)
+func (d *decoder) decodeJPEGBlock(img image.Image, source jpegSource, x, y, width, height int) error {
+	c, err := jpeg.DecodeConfig(source())
 	if err != nil {
 		return err
 	}
@@ -869,10 +906,7 @@ func (d *decoder) decodeJPEGBlock(img image.Image, rd io.ReadSeeker, x, y, width
 	if c.Width != width || c.Height != height {
 		return FormatError("JPEG dimensions do not match TIFF block")
 	}
-	if _, err := rd.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	decoded, _, err := image.Decode(rd)
+	decoded, _, err := image.Decode(source())
 	if err != nil {
 		return err
 	}
@@ -881,15 +915,15 @@ func (d *decoder) decodeJPEGBlock(img image.Image, rd io.ReadSeeker, x, y, width
 }
 
 func (d *decoder) decodeJPGOld(img image.Image, offset, n, lim int64, x, y, width, height int) error {
-	var rd io.ReadSeeker = io.NewSectionReader(d.r, offset, n)
+	source := sectionJPEGSource(d.r, offset, n)
 	if len(d.features[tBitsPerSample]) == 4 && d.firstVal(tExtraSamples) > 0 {
 		var err error
-		rd, err = d.prepJPEG(offset, n, lim, true, false)
+		source, err = d.prepJPEG(offset, n, lim, true, false)
 		if err != nil {
 			return err
 		}
 	}
-	return d.decodeJPEGBlock(img, rd, x, y, width, height)
+	return d.decodeJPEGBlock(img, source, x, y, width, height)
 }
 
 type blockLayout struct {
@@ -1116,11 +1150,11 @@ func (d *decoder) decodeCompressedJPEG(img image.Image, b tiffBlock, limit int64
 		return d.decodeJPGOld(img, b.offset, b.n, limit, b.x, b.y, b.width, b.height)
 	}
 	needAPP14 := len(d.features[tBitsPerSample]) == 4 && d.firstVal(tExtraSamples) > 0
-	rd, err := d.prepJPEG(b.offset, b.n, limit, needAPP14, true)
+	source, err := d.prepJPEG(b.offset, b.n, limit, needAPP14, true)
 	if err != nil {
 		return err
 	}
-	return d.decodeJPEGBlock(img, rd, b.x, b.y, b.width, b.height)
+	return d.decodeJPEGBlock(img, source, b.x, b.y, b.width, b.height)
 }
 
 func (d *decoder) decodeBlock(img image.Image, b tiffBlock, limit int64) error {
@@ -1167,6 +1201,9 @@ func (d *decoder) decodeBlocks(img image.Image, l blockLayout, limit int64) erro
 }
 
 func decode(d *decoder) (image.Image, error) {
+	if err := d.loadJPEGTables(); err != nil {
+		return nil, err
+	}
 	l, err := d.readBlockLayout()
 	if err != nil {
 		return nil, err

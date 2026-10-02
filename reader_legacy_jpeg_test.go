@@ -28,6 +28,7 @@ type legacyJPEGSpec struct {
 	compression                            uint16
 	blocks                                 [][]byte
 	tiled, tables, alpha                   bool
+	tableData                              []byte
 }
 
 func legacyJPEGShort(tag uint16, values ...uint16) legacyJPEGField {
@@ -69,7 +70,10 @@ func legacyJPEGFields(s legacyJPEGSpec, offsets, counts []uint32) []legacyJPEGFi
 	}
 	if s.tables {
 		// A shared COM marker exercises table insertion without changing the image's coding tables.
-		data := []byte{0xff, 0xd8, 0xff, 0xfe, 0, 4, 'o', 'k', 0xff, 0xd9}
+		data := s.tableData
+		if data == nil {
+			data = []byte{0xff, 0xd8, 0xff, 0xfe, 0, 4, 'o', 'k', 0xff, 0xd9}
+		}
 		f = append(f, legacyJPEGField{tJPEGTables, 7, uint32(len(data)), data})
 	}
 	sort.Slice(f, func(i, j int) bool { return f[i].tag < f[j].tag })
@@ -224,22 +228,41 @@ type legacyJPEGTrackedReader struct {
 	*bytes.Reader
 	jpegEnd  int64
 	jpegRead int
+	maxRead  int
 }
 
 func (r *legacyJPEGTrackedReader) ReadAt(p []byte, off int64) (int, error) {
+	if len(p) > r.maxRead {
+		r.maxRead = len(p)
+	}
 	if off >= 8 && off < r.jpegEnd {
 		r.jpegRead += len(p)
 	}
 	return r.Reader.ReadAt(p, off)
 }
 
-// TestLegacyJPEGConfigStreams ensures rejected unprepared blocks do not read their full compressed segment.
+// TestLegacyJPEGConfigStreams ensures rejected blocks do not read their full compressed segment.
 func TestLegacyJPEGConfigStreams(t *testing.T) {
-	for _, compression := range []uint16{cJPEGOld, cJPEG} {
-		t.Run(fmt.Sprintf("compression=%d", compression), func(t *testing.T) {
-			payload := append(legacyTestJPEG(t, 3, 4), make([]byte, 1<<20)...)
+	for _, mode := range []struct {
+		name          string
+		compression   uint16
+		tables, alpha bool
+	}{
+		{"old", cJPEGOld, false, false},
+		{"old_app14", cJPEGOld, false, true},
+		{"new", cJPEG, false, false},
+		{"new_shared_tables", cJPEG, true, false},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			payload := legacyTestJPEG(t, 3, 4)
+			var tables []byte
+			if mode.tables {
+				tables, payload = splitTestJPEG(payload)
+			}
+			payload = append(payload, make([]byte, 1<<20)...)
 			s := legacyJPEGSpec{width: 4, height: 4, blockWidth: 4, blockHeight: 4,
-				compression: compression, blocks: [][]byte{payload}}
+				compression: mode.compression, blocks: [][]byte{payload}, tables: mode.tables,
+				tableData: tables, alpha: mode.alpha}
 			b := legacyJPEGFixture(t, s)
 			r := &legacyJPEGTrackedReader{Reader: bytes.NewReader(b), jpegEnd: int64(8 + len(payload))}
 			_, err := Decode(r)
@@ -251,6 +274,48 @@ func TestLegacyJPEGConfigStreams(t *testing.T) {
 				t.Fatalf("read %d bytes of a rejected %d-byte JPEG segment", r.jpegRead, len(payload))
 			}
 		})
+	}
+}
+
+func TestLegacyJPEGSharedTablesIgnoreMarkerPayload(t *testing.T) {
+	payload := legacyTestJPEG(t, 4, 4)
+	tables, payload := splitTestJPEG(payload)
+	payload = insertTestJPEGMarker(payload, 0xfe, []byte{'a', 0xff, 0xda, 'b'}, false)
+	s := legacyJPEGSpec{width: 4, height: 4, blockWidth: 4, blockHeight: 4,
+		compression: cJPEG, blocks: [][]byte{payload}, tables: true, tableData: tables}
+	checkLegacyJPEG(t, s, "")
+}
+
+func TestJPEGTablesUseBoundedReads(t *testing.T) {
+	payload := legacyTestJPEG(t, 4, 4)
+	tables, payload := splitTestJPEG(payload)
+	largeTables := append([]byte(nil), tables[:2]...)
+	comment := make([]byte, 60_000)
+	for range 20 {
+		largeTables = appendJPEGMarker(largeTables, 0xfe, comment)
+		largeTables = append(largeTables, tables[2:len(tables)-2]...)
+	}
+	largeTables = append(largeTables, 0xff, 0xd9)
+	s := legacyJPEGSpec{width: 4, height: 4, blockWidth: 4, blockHeight: 4,
+		compression: cJPEG, blocks: [][]byte{payload}, tables: true, tableData: largeTables}
+	b := legacyJPEGFixture(t, s)
+	r := &legacyJPEGTrackedReader{Reader: bytes.NewReader(b), jpegEnd: int64(8 + len(payload))}
+	d, err := newDecoderAt(r, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := d.jpegTables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(canonical) > 4<<10 {
+		t.Fatalf("retained %d bytes of effective JPEG tables", len(canonical))
+	}
+	if _, err := Decode(r); err != nil {
+		t.Fatal(err)
+	}
+	if r.maxRead > len(comment) {
+		t.Fatalf("largest read = %d bytes, want at most %d", r.maxRead, len(comment))
 	}
 }
 

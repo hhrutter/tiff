@@ -139,6 +139,8 @@ func TestYCbCrJPEGTables(t *testing.T) {
 		{"bad_end", []byte{0xff, 0xd8, 0, 0}, false},
 		{"bad_length", []byte{0xff, 0xd8, 0xff, 0xdb, 0, 1, 0xff, 0xd9}, false},
 		{"truncated", []byte{0xff, 0xd8, 0xff, 0xdb, 0, 8, 0xff, 0xd9}, false},
+		{"bad_quantization_table", []byte{0xff, 0xd8, 0xff, 0xdb, 0, 3, 0x20, 0xff, 0xd9}, false},
+		{"bad_huffman_table", []byte{0xff, 0xd8, 0xff, 0xc4, 0, 3, 0, 0xff, 0xd9}, false},
 		{"trailing", []byte{0xff, 0xd8, 0xff, 0xd9, 0}, false},
 	}
 	for _, tc := range cases {
@@ -241,7 +243,7 @@ func TestPreparedJPEGDimensions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := jpeg.Decode(r); err != nil {
+			if _, err := jpeg.Decode(r()); err != nil {
 				t.Fatal(err)
 			}
 		})
